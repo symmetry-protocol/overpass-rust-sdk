@@ -1,0 +1,95 @@
+use jupiter_amm_interface::SwapParams;
+use solana_program::instruction::AccountMeta;
+use solana_program::pubkey::Pubkey;
+use solana_program::sysvar;
+
+use super::state::KlendState;
+use super::KLEND_PROGRAM_ID;
+use crate::error::OverpassError;
+use crate::common::programs::{
+    derive_ata, ATA_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+};
+use crate::accounts::{global_config_pda, WrapperVault};
+
+use crate::common::direction::{from_swap, Direction};
+
+pub fn build(
+    state: &KlendState,
+    wv: &WrapperVault,
+    params: &SwapParams,
+) -> Result<Vec<AccountMeta>, OverpassError> {
+    let direction = from_swap(wv, params)?;
+
+    let user = params.token_transfer_authority;
+    let wrapper_mint = wv.wrapper_mint;
+    let underlying_mint = wv.underlying_mint;
+    let collateral_mint = state.collateral_mint_pubkey;
+
+    let global_config = global_config_pda();
+    let (wrapper_vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", wrapper_mint.as_ref()], &crate::OVERPASS_PROGRAM_ID);
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[b"authority", wrapper_mint.as_ref()], &crate::OVERPASS_PROGRAM_ID);
+    let (lending_market_authority, _) = Pubkey::find_program_address(
+        &[b"lma", state.lending_market.as_ref()],
+        &KLEND_PROGRAM_ID,
+    );
+
+    let (user_underlying_ata, user_wrapper_ata) = match direction {
+        Direction::Deposit => (params.source_token_account, params.destination_token_account),
+        Direction::Withdraw => (params.destination_token_account, params.source_token_account),
+    };
+
+    let underlying_token_program = resolve_token_program(state.liquidity_token_program);
+    let vault_underlying_ata = derive_ata(&vault_authority, &underlying_mint, &underlying_token_program);
+    let vault_collateral_ata = derive_ata(&vault_authority, &collateral_mint, &SPL_TOKEN_PROGRAM_ID);
+
+    let mut metas = vec![
+        AccountMeta::new(user, true),
+        AccountMeta::new_readonly(global_config, false),
+        AccountMeta::new(wrapper_vault_pda, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new(wrapper_mint, false),
+        AccountMeta::new(underlying_mint, false),
+        AccountMeta::new(collateral_mint, false),
+        AccountMeta::new(user_wrapper_ata, false),
+        AccountMeta::new(user_underlying_ata, false),
+        AccountMeta::new(vault_underlying_ata, false),
+        AccountMeta::new(vault_collateral_ata, false),
+        AccountMeta::new(wv.source_pool, false),
+        AccountMeta::new_readonly(state.lending_market, false),
+        AccountMeta::new_readonly(lending_market_authority, false),
+        AccountMeta::new(state.supply_vault, false),
+        AccountMeta::new_readonly(sysvar::instructions::ID, false),
+        AccountMeta::new_readonly(KLEND_PROGRAM_ID, false),
+        AccountMeta::new_readonly(underlying_token_program, false),
+        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(ATA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+
+    metas.push(oracle_or_placeholder(state.pyth_price));
+    metas.push(oracle_or_placeholder(state.switchboard_price_aggregator));
+    metas.push(oracle_or_placeholder(state.switchboard_twap_aggregator));
+    metas.push(oracle_or_placeholder(state.scope_price_feed));
+
+    Ok(metas)
+}
+
+
+fn oracle_or_placeholder(key: Pubkey) -> AccountMeta {
+    if key == Pubkey::default() {
+        AccountMeta::new_readonly(KLEND_PROGRAM_ID, false)
+    } else {
+        AccountMeta::new_readonly(key, false)
+    }
+}
+
+fn resolve_token_program(stored: Pubkey) -> Pubkey {
+    if stored == TOKEN_2022_PROGRAM_ID {
+        TOKEN_2022_PROGRAM_ID
+    } else {
+        SPL_TOKEN_PROGRAM_ID
+    }
+}
