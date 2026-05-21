@@ -1,152 +1,309 @@
-//! Port of <https://github.com/lulo-labs/lulo-v2-cpi>.
-
-use jupiter_amm_interface::{Quote, QuoteParams, SwapMode};
-use rust_decimal::Decimal;
-
 use super::state::LuloState;
-use crate::common::checked::{mul_bps, u128_to_u64};
+use crate::accounts::{GlobalConfig, WrapperVault};
+use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64};
+use crate::common::u256::U256;
 use crate::error::OverpassError;
-use crate::accounts::WrapperVault;
-use crate::QuoteCtx;
 
-
-pub fn quote(
-    state: &LuloState,
-    wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    if params.swap_mode != SwapMode::ExactIn {
-        return Err(OverpassError::UnsupportedSwapMode);
-    }
-    if params.amount == 0 {
-        return Err(OverpassError::InvalidAmount);
-    }
-    if params.input_mint == wv.underlying_mint && params.output_mint == wv.wrapper_mint {
-        quote_deposit(state, wv, ctx, params)
-    } else if params.input_mint == wv.wrapper_mint && params.output_mint == wv.underlying_mint {
-        quote_withdraw(state, wv, params)
-    } else {
-        Err(OverpassError::InvalidState("lulo: mint pair mismatch"))
-    }
+fn math_err(_label: &'static str) -> OverpassError {
+    OverpassError::MathOverflow
 }
 
-fn quote_deposit(
+const Q60_SHIFT: usize = 60;
+
+fn cpos(pa: u64, pts: u64, lp: u128, basis_q60: u128) -> Result<u64, OverpassError> {
+    if pts == 0 || pa == 0 || lp == 0 {
+        return Ok(0);
+    }
+    let q60: U256 = U256::one() << Q60_SHIFT;
+    let pa_q60 = U256::from(pa) * q60;
+    let basis_pts = U256::from(basis_q60) * U256::from(pts);
+    let gain_q60 = if basis_pts >= pa_q60 {
+        U256::zero()
+    } else {
+        pa_q60 - basis_pts
+    };
+    let profit = (gain_q60 * U256::from(lp)) / (U256::from(pts) * q60);
+    u64::try_from(profit.low_u128()).map_err(|_| math_err("lulo profit overflow"))
+}
+
+fn fee_from_profit(profit_usdc: u64, ref_bps: u16) -> Result<u64, OverpassError> {
+    let pb = (profit_usdc as u128)
+        .checked_mul(ref_bps as u128)
+        .ok_or(math_err("lulo fee mul"))?;
+    Ok(if pb == 0 {
+        0
+    } else {
+        ((pb - 1) / 10_000) as u64
+    })
+}
+
+fn position_fee_usdc(
+    pa: u64,
+    pts: u64,
+    lp_a: u128,
+    old_lp: u128,
+    charged_q60: u128,
+    avg_q60: u128,
+    ref_bps: u16,
+) -> Result<u64, OverpassError> {
+    let a = cpos(pa, pts, lp_a, charged_q60)?;
+    let b = cpos(pa, pts, old_lp, avg_q60)?;
+    fee_from_profit(a.min(b), ref_bps)
+}
+
+fn lulo_lp_value(
+    pa: u64,
+    pts: u64,
+    old_lp: u128,
+    charged_q60: u128,
+    avg_q60: u128,
+    ref_bps: u16,
+) -> Result<u64, OverpassError> {
+    if pts == 0 || pa == 0 || old_lp == 0 {
+        return Ok(0);
+    }
+    let fee_usdc = position_fee_usdc(pa, pts, old_lp, old_lp, charged_q60, avg_q60, ref_bps)?;
+    let gross = u64::try_from(
+        old_lp
+            .checked_mul(pa as u128)
+            .and_then(|x| x.checked_div(pts as u128))
+            .ok_or(math_err("lulo gross"))?,
+    )
+    .map_err(|_| math_err("lulo gross overflow"))?;
+    Ok(gross.saturating_sub(fee_usdc))
+}
+
+pub fn quote_deposit(
     state: &LuloState,
     wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    let amount = params.amount;
-    let protocol_fee = mul_bps(amount, ctx.protocol_deposit_fee_bps)?;
+    gc: &GlobalConfig,
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(math_err("zero amount"));
+    }
+    if state.halted_flag != 0 {
+        return Err(math_err("lulo halted"));
+    }
+    let protocol_fee = mul_bps(amount, gc.protocol_deposit_fee_bps)?;
     let creator_fee = mul_bps(amount, wv.creator_deposit_fee_bps)?;
     let total_fee = protocol_fee
         .checked_add(creator_fee)
-        .ok_or(OverpassError::MathOverflow)?;
+        .ok_or(math_err("deposit fee sum"))?;
     let net_amount = amount
         .checked_sub(total_fee)
-        .ok_or(OverpassError::MathOverflow)?;
+        .ok_or(math_err("net amount"))?;
     if net_amount == 0 {
-        return Err(OverpassError::InvalidAmount);
+        return Err(math_err("net amount zero"));
     }
 
-    let pre_lp = wv.intermediate_held;
-    let lp_value_before: u64 = if state.protected_total_supply == 0 {
-        0
-    } else {
-        let v = pre_lp
-            .checked_mul(state.protected_amount as u128)
-            .and_then(|x| x.checked_div(state.protected_total_supply as u128))
-            .ok_or(OverpassError::MathOverflow)?;
-        u128_to_u64(v)?
-    };
+    let cap_headroom = state.deposit_limit.saturating_sub(state.protected_amount);
+    if net_amount > cap_headroom / 2 {
+        return Err(math_err("lulo coverage cap"));
+    }
+
+    let pa = state.protected_amount;
+    let pts = state.protected_total_supply;
+    let old_lp = wv.intermediate_held;
+
+    let lp_value_before = lulo_lp_value(
+        pa,
+        pts,
+        old_lp,
+        state.charged_q60,
+        state.avg_q60,
+        state.ref_bps,
+    )?;
     let total_value_before = wv
         .free_underlying_held
         .checked_add(lp_value_before)
-        .ok_or(OverpassError::MathOverflow)?;
+        .ok_or(math_err("total value"))?;
+
+    let buffer_total = wv
+        .free_underlying_held
+        .checked_add(net_amount)
+        .ok_or(math_err("buffer overflow"))?;
+    if pa == 0 {
+        return Err(math_err("lulo pa=0"));
+    }
+    let new_lp = (buffer_total as u128)
+        .checked_mul(pts as u128)
+        .and_then(|x| x.checked_div(pa as u128))
+        .ok_or(math_err("new_lp"))?;
+    let lp_a = old_lp.checked_add(new_lp).ok_or(math_err("lp_a"))?;
+    let fee_usdc = position_fee_usdc(
+        pa,
+        pts,
+        lp_a,
+        old_lp,
+        state.charged_q60,
+        state.avg_q60,
+        state.ref_bps,
+    )?;
+    let fee_lp_ceil: u128 = if fee_usdc == 0 {
+        0
+    } else {
+        let num = (fee_usdc as u128)
+            .checked_mul(pts as u128)
+            .ok_or(math_err("fee_lp num"))?;
+        num.checked_add((pa as u128) - 1)
+            .and_then(|x| x.checked_div(pa as u128))
+            .ok_or(math_err("fee_lp_ceil"))?
+    };
+    let lp_net_pred = new_lp.saturating_sub(fee_lp_ceil);
+    let post_lp_pred = old_lp
+        .checked_add(lp_net_pred)
+        .ok_or(math_err("post_lp_pred"))?;
+    let post_value = lulo_lp_value(
+        pa,
+        pts,
+        post_lp_pred,
+        state.charged_q60,
+        state.avg_q60,
+        state.ref_bps,
+    )?;
+    let post_fee = position_fee_usdc(
+        pa,
+        pts,
+        post_lp_pred,
+        post_lp_pred,
+        state.charged_q60,
+        state.avg_q60,
+        state.ref_bps,
+    )?;
+    let staked_value = post_value
+        .checked_add(post_fee)
+        .ok_or(math_err("post gross"))?;
+    let new_value_pred = staked_value.min(
+        total_value_before
+            .checked_add(net_amount)
+            .ok_or(math_err("dust value"))?,
+    );
+    let value_added = new_value_pred.saturating_sub(total_value_before);
 
     let wrapper_to_mint: u64 = if wv.wrapper_supply == 0 {
         if total_value_before != 0 {
-            return Err(OverpassError::InvalidState(
-                "lulo: wrapper_supply=0 but total_value>0",
-            ));
+            return Err(math_err("supply=0 value>0"));
         }
-        net_amount
+        new_value_pred
     } else {
         if total_value_before == 0 {
-            return Err(OverpassError::InvalidState(
-                "lulo: wrapper_supply>0 but total_value=0",
-            ));
+            return Err(math_err("supply>0 value=0"));
         }
         u128_to_u64(
-            (net_amount as u128)
+            (value_added as u128)
                 .checked_mul(wv.wrapper_supply as u128)
                 .and_then(|x| x.checked_div(total_value_before as u128))
-                .ok_or(OverpassError::MathOverflow)?,
+                .ok_or(math_err("mint calc"))?,
         )?
     };
     if wrapper_to_mint == 0 {
-        return Err(OverpassError::InvalidAmount);
+        return Err(math_err("mint zero"));
     }
 
-    let fee_pct_bps = ctx.protocol_deposit_fee_bps as i64 + wv.creator_deposit_fee_bps as i64;
-    let fee_pct = Decimal::new(fee_pct_bps, 4);
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_add(wrapper_to_mint)
+        .ok_or(math_err("new supply"))?;
+    require_no_value_per_share_loss(
+        total_value_before as u128,
+        wv.wrapper_supply,
+        new_value_pred as u128,
+        new_wrapper_supply,
+    )?;
 
-    Ok(Quote {
-        in_amount: amount,
-        out_amount: wrapper_to_mint,
-        fee_amount: total_fee,
-        fee_mint: wv.underlying_mint,
-        fee_pct,
-    })
+    Ok(wrapper_to_mint)
 }
 
-fn quote_withdraw(
+pub fn quote_withdraw(
     state: &LuloState,
     wv: &WrapperVault,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    let burn_amount = params.amount;
-    if burn_amount > wv.wrapper_supply {
-        return Err(OverpassError::BurnExceedsWrapperSupply);
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(math_err("zero amount"));
+    }
+    if state.halted_flag != 0 {
+        return Err(math_err("lulo halted"));
+    }
+    if amount > wv.wrapper_supply {
+        return Err(math_err("burn exceeds supply"));
     }
     if wv.wrapper_supply == 0 {
-        return Err(OverpassError::InvalidState("lulo: wrapper_supply=0"));
+        return Err(math_err("supply zero"));
     }
 
-    let pre_lp = wv.intermediate_held;
-    let lp_value: u64 = if state.protected_total_supply == 0 {
-        0
-    } else {
-        let v = pre_lp
-            .checked_mul(state.protected_amount as u128)
-            .and_then(|x| x.checked_div(state.protected_total_supply as u128))
-            .ok_or(OverpassError::MathOverflow)?;
-        u128_to_u64(v)?
-    };
+    let pa = state.protected_amount;
+    let pts = state.protected_total_supply;
+    let old_lp = wv.intermediate_held;
+    let lp_value = lulo_lp_value(
+        pa,
+        pts,
+        old_lp,
+        state.charged_q60,
+        state.avg_q60,
+        state.ref_bps,
+    )?;
     let total_value_before = wv
         .free_underlying_held
         .checked_add(lp_value)
-        .ok_or(OverpassError::MathOverflow)?;
+        .ok_or(math_err("total value"))?;
     if total_value_before == 0 {
-        return Err(OverpassError::InvalidState("lulo: total_value=0"));
+        return Err(math_err("total value zero"));
     }
 
-    let n_owed = u128_to_u64(
-        (burn_amount as u128)
-            .checked_mul(total_value_before as u128)
-            .and_then(|x| x.checked_div(wv.wrapper_supply as u128))
-            .ok_or(OverpassError::MathOverflow)?,
-    )?;
+    if amount == wv.wrapper_supply {
+        return Err(math_err(
+            "lulo full-exit not quoted (drain-zone); withdraw supply-1",
+        ));
+    }
+    let n_owed: u64 = {
+        let s = wv.wrapper_supply as u128;
+        let b = amount as u128;
+        let free_share = b
+            .checked_mul(wv.free_underlying_held as u128)
+            .and_then(|x| x.checked_div(s))
+            .ok_or(math_err("free share"))?;
+        let user_lp = b
+            .checked_mul(old_lp)
+            .and_then(|x| x.checked_div(s))
+            .ok_or(math_err("user lp"))?;
+        let lp_part = if old_lp == 0 {
+            0
+        } else {
+            (lp_value as u128)
+                .checked_mul(user_lp)
+                .and_then(|x| x.checked_div(old_lp))
+                .ok_or(math_err("lp part"))?
+        };
+        let ceil_price: u128 = if pts == 0 {
+            0
+        } else {
+            (pa as u128).div_ceil(pts as u128)
+        };
+        let owed = free_share
+            .checked_add(lp_part)
+            .ok_or(math_err("owed calc"))?
+            .saturating_sub(ceil_price + 1);
+        u128_to_u64(owed)?
+    };
     if n_owed == 0 {
-        return Err(OverpassError::InvalidAmount);
+        return Err(math_err("owed zero"));
     }
 
-    Ok(Quote {
-        in_amount: burn_amount,
-        out_amount: n_owed,
-        fee_amount: 0,
-        fee_mint: wv.underlying_mint,
-        fee_pct: Decimal::ZERO,
-    })
+    let new_value_pred = (total_value_before as u128)
+        .checked_sub(n_owed as u128)
+        .ok_or(math_err("new value pred"))?;
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_sub(amount)
+        .ok_or(math_err("new supply"))?;
+    require_no_value_per_share_loss(
+        total_value_before as u128,
+        wv.wrapper_supply,
+        new_value_pred,
+        new_wrapper_supply,
+    )?;
+
+    Ok(n_owed)
 }

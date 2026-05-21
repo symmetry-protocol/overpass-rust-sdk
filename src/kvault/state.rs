@@ -1,9 +1,8 @@
-//! Port of <https://github.com/Kamino-Finance/kvault>.
-
 use solana_program::pubkey::Pubkey;
 
-use crate::common::bytes::{read_pubkey, read_u64, read_u128};
+use crate::common::bytes::{read_pubkey, read_u128, read_u64};
 use crate::common::programs::SPL_TOKEN_PROGRAM_ID;
+use crate::common::u256::U256;
 use crate::error::OverpassError;
 use crate::klend::fraction::Fraction;
 
@@ -89,6 +88,8 @@ pub struct KvaultState {
     pub cached_farm_state: Option<FarmStateMinimal>,
 
     pub underlying_token_program: Pubkey,
+
+    pub position_kvault_shares: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,12 +97,16 @@ pub struct FarmStateMinimal {
     pub farm_vault: Pubkey,
     pub farm_vaults_authority: Pubkey,
     pub scope_prices: Option<Pubkey>,
+    pub total_active_stake_scaled: u128,
+    pub total_staked_amount: u64,
 }
 
 const FARM_OFF_VAULT: usize = 7256;
 const FARM_OFF_VAULTS_AUTHORITY: usize = 7288;
 const FARM_OFF_SCOPE_PRICES: usize = 7536;
 const FARM_MIN_LEN: usize = FARM_OFF_SCOPE_PRICES + 32;
+const FARM_OFF_TOTAL_STAKED_AMOUNT: usize = 7248;
+const FARM_OFF_TOTAL_ACTIVE_STAKE_SCALED: usize = 7408;
 
 pub fn empty() -> KvaultState {
     KvaultState {
@@ -119,22 +124,41 @@ pub fn decode(data: &[u8]) -> Result<KvaultState, OverpassError> {
     }
 
     let token_mint = read_pubkey(data, OFF_TOKEN_MINT, "kvault.token_mint")?;
-    let token_mint_decimals = read_u64(data, OFF_TOKEN_MINT_DECIMALS, "kvault.token_mint_decimals")? as u8;
+    let token_mint_decimals =
+        read_u64(data, OFF_TOKEN_MINT_DECIMALS, "kvault.token_mint_decimals")? as u8;
     let token_vault = read_pubkey(data, OFF_TOKEN_VAULT, "kvault.token_vault")?;
     let shares_mint = read_pubkey(data, OFF_SHARES_MINT, "kvault.shares_mint")?;
-    let base_vault_authority = read_pubkey(data, OFF_BASE_VAULT_AUTHORITY, "kvault.base_vault_authority")?;
+    let base_vault_authority = read_pubkey(
+        data,
+        OFF_BASE_VAULT_AUTHORITY,
+        "kvault.base_vault_authority",
+    )?;
     let token_available = read_u64(data, OFF_TOKEN_AVAILABLE, "kvault.token_available")?;
     let shares_issued = read_u64(data, OFF_SHARES_ISSUED, "kvault.shares_issued")?;
     let crank_fund_fee_per_reserve = read_u64(data, OFF_CRANK_FUND_FEE, "kvault.crank_fund_fee")?;
-    let performance_fee_bps = read_u64(data, OFF_PERFORMANCE_FEE_BPS, "kvault.performance_fee_bps")?;
+    let performance_fee_bps =
+        read_u64(data, OFF_PERFORMANCE_FEE_BPS, "kvault.performance_fee_bps")?;
     let management_fee_bps = read_u64(data, OFF_MANAGEMENT_FEE_BPS, "kvault.management_fee_bps")?;
-    let last_fee_charge_timestamp = read_u64(data, OFF_LAST_FEE_CHARGE_TIMESTAMP, "kvault.last_fee_charge_timestamp")?;
+    let last_fee_charge_timestamp = read_u64(
+        data,
+        OFF_LAST_FEE_CHARGE_TIMESTAMP,
+        "kvault.last_fee_charge_timestamp",
+    )?;
     let prev_aum_sf = read_u128(data, OFF_PREV_AUM_SF, "kvault.prev_aum_sf")?;
     let pending_fees_sf = read_u128(data, OFF_PENDING_FEES_SF, "kvault.pending_fees_sf")?;
     let min_deposit_amount = read_u64(data, OFF_MIN_DEPOSIT_AMOUNT, "kvault.min_deposit_amount")?;
-    let min_withdraw_amount = read_u64(data, OFF_MIN_WITHDRAW_AMOUNT, "kvault.min_withdraw_amount")?;
-    let vault_withdrawal_penalty_lamports = read_u64(data, OFF_WITHDRAWAL_PENALTY_LAMPORTS, "kvault.withdrawal_penalty_lamports")?;
-    let vault_withdrawal_penalty_bps = read_u64(data, OFF_WITHDRAWAL_PENALTY_BPS, "kvault.withdrawal_penalty_bps")?;
+    let min_withdraw_amount =
+        read_u64(data, OFF_MIN_WITHDRAW_AMOUNT, "kvault.min_withdraw_amount")?;
+    let vault_withdrawal_penalty_lamports = read_u64(
+        data,
+        OFF_WITHDRAWAL_PENALTY_LAMPORTS,
+        "kvault.withdrawal_penalty_lamports",
+    )?;
+    let vault_withdrawal_penalty_bps = read_u64(
+        data,
+        OFF_WITHDRAWAL_PENALTY_BPS,
+        "kvault.withdrawal_penalty_bps",
+    )?;
 
     let mut active_allocations = Vec::with_capacity(4);
     for i in 0..MAX_RESERVES {
@@ -143,10 +167,26 @@ pub fn decode(data: &[u8]) -> Result<KvaultState, OverpassError> {
         if reserve == Pubkey::default() {
             continue;
         }
-        let ctoken_vault = read_pubkey(data, base + ALLOC_OFF_CTOKEN_VAULT, "kvault.allocation.ctoken_vault")?;
-        let target_allocation_weight = read_u64(data, base + ALLOC_OFF_TARGET_ALLOCATION_WEIGHT, "kvault.allocation.target_weight")?;
-        let token_allocation_cap = read_u64(data, base + ALLOC_OFF_TOKEN_ALLOCATION_CAP, "kvault.allocation.token_cap")?;
-        let ctoken_allocation = read_u64(data, base + ALLOC_OFF_CTOKEN_ALLOCATION, "kvault.allocation.ctoken_allocation")?;
+        let ctoken_vault = read_pubkey(
+            data,
+            base + ALLOC_OFF_CTOKEN_VAULT,
+            "kvault.allocation.ctoken_vault",
+        )?;
+        let target_allocation_weight = read_u64(
+            data,
+            base + ALLOC_OFF_TARGET_ALLOCATION_WEIGHT,
+            "kvault.allocation.target_weight",
+        )?;
+        let token_allocation_cap = read_u64(
+            data,
+            base + ALLOC_OFF_TOKEN_ALLOCATION_CAP,
+            "kvault.allocation.token_cap",
+        )?;
+        let ctoken_allocation = read_u64(
+            data,
+            base + ALLOC_OFF_CTOKEN_ALLOCATION,
+            "kvault.allocation.ctoken_allocation",
+        )?;
         active_allocations.push(ActiveAllocation {
             reserve,
             ctoken_vault,
@@ -181,6 +221,7 @@ pub fn decode(data: &[u8]) -> Result<KvaultState, OverpassError> {
         cached_reserves: Vec::new(),
         cached_farm_state: None,
         underlying_token_program: SPL_TOKEN_PROGRAM_ID,
+        position_kvault_shares: 0,
     })
 }
 
@@ -189,18 +230,63 @@ pub fn decode_farm_state_minimal(data: &[u8]) -> Result<FarmStateMinimal, Overpa
         return Err(OverpassError::InvalidAccount("kfarms FarmState: length"));
     }
     let farm_vault = read_pubkey(data, FARM_OFF_VAULT, "kfarms.farm_vault")?;
-    let farm_vaults_authority = read_pubkey(data, FARM_OFF_VAULTS_AUTHORITY, "kfarms.farm_vaults_authority")?;
+    let farm_vaults_authority = read_pubkey(
+        data,
+        FARM_OFF_VAULTS_AUTHORITY,
+        "kfarms.farm_vaults_authority",
+    )?;
     let scope_raw = read_pubkey(data, FARM_OFF_SCOPE_PRICES, "kfarms.scope_prices")?;
     let scope_prices = if scope_raw == Pubkey::default() {
         None
     } else {
         Some(scope_raw)
     };
+    let total_active_stake_scaled = read_u128(
+        data,
+        FARM_OFF_TOTAL_ACTIVE_STAKE_SCALED,
+        "kfarms.total_active_stake_scaled",
+    )?;
+    let total_staked_amount = read_u64(
+        data,
+        FARM_OFF_TOTAL_STAKED_AMOUNT,
+        "kfarms.total_staked_amount",
+    )?;
     Ok(FarmStateMinimal {
         farm_vault,
         farm_vaults_authority,
         scope_prices,
+        total_active_stake_scaled,
+        total_staked_amount,
     })
+}
+
+pub fn convert_stake_to_amount(
+    stake_scaled: u128,
+    total_stake_scaled: u128,
+    total_amount: u64,
+) -> Result<u64, OverpassError> {
+    const WAD: u128 = 1_000_000_000_000_000_000;
+    if stake_scaled == 0 {
+        return Ok(0);
+    }
+    if total_stake_scaled == 0 {
+        return Ok(total_amount);
+    }
+    let result_scaled = U256::from(stake_scaled)
+        .checked_mul(U256::from(WAD))
+        .and_then(|x| x.checked_mul(U256::from(total_amount)))
+        .and_then(|n| n.checked_div(U256::from(total_stake_scaled)))
+        .ok_or(OverpassError::MathOverflow)?;
+    if result_scaled > (U256::one() << 192) - U256::one() {
+        return Err(OverpassError::MathOverflow);
+    }
+    let amount = result_scaled
+        .checked_div(U256::from(WAD))
+        .ok_or(OverpassError::MathOverflow)?;
+    if amount > U256::from(u64::MAX) {
+        return Err(OverpassError::MathOverflow);
+    }
+    Ok(amount.low_u64())
 }
 
 pub fn decode_global_config_penalty(data: &[u8]) -> Result<(u64, u64), OverpassError> {
@@ -209,8 +295,16 @@ pub fn decode_global_config_penalty(data: &[u8]) -> Result<(u64, u64), OverpassE
             "kvault global_config: length",
         ));
     }
-    let lamports = read_u64(data, KGC_OFF_WITHDRAWAL_PENALTY_LAMPORTS, "kvault_gc.withdrawal_penalty_lamports")?;
-    let bps = read_u64(data, KGC_OFF_WITHDRAWAL_PENALTY_BPS, "kvault_gc.withdrawal_penalty_bps")?;
+    let lamports = read_u64(
+        data,
+        KGC_OFF_WITHDRAWAL_PENALTY_LAMPORTS,
+        "kvault_gc.withdrawal_penalty_lamports",
+    )?;
+    let bps = read_u64(
+        data,
+        KGC_OFF_WITHDRAWAL_PENALTY_BPS,
+        "kvault_gc.withdrawal_penalty_bps",
+    )?;
     Ok((lamports, bps))
 }
 

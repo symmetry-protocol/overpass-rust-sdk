@@ -1,19 +1,12 @@
-//! Port of <https://github.com/Kamino-Finance/klend> @ `3f7bd69`.
-
-use jupiter_amm_interface::{Quote, QuoteParams, SwapMode};
-use rust_decimal::Decimal;
-
-use super::state::{KlendState, BORROW_RATE_CURVE_LEN};
-use super::withdrawal_caps;
-use crate::common::checked::{mul_bps, u128_to_u64, FULL_BPS};
-use crate::common::direction::Direction;
-use crate::common::u256::U256;
-use crate::error::OverpassError;
 use super::fraction::{
     approximate_compounded_interest, bps_to_fraction, percent_to_fraction, BigFraction, Fraction,
 };
-use crate::accounts::WrapperVault;
-use crate::QuoteCtx;
+use super::state::{KlendState, BORROW_RATE_CURVE_LEN};
+use super::withdrawal_caps;
+use crate::accounts::{GlobalConfig, WrapperVault};
+use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64, FULL_BPS};
+use crate::common::u256::U256;
+use crate::error::OverpassError;
 
 pub const POINTS_IN_CURVE: usize = 11;
 pub const POINT_SIZE: usize = 8;
@@ -21,53 +14,12 @@ pub const SLOTS_PER_YEAR: u64 = 63_072_000;
 pub const PROGRAM_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AccruedKlend {
-    pub(crate) borrowed_amount_sf: u128,
-    pub(crate) accumulated_protocol_fees_sf: u128,
-    pub(crate) pending_referrer_fees_sf: u128,
-    pub(crate) accumulated_referrer_fees_sf: u128,
+pub struct AccruedKlend {
+    pub borrowed_amount_sf: u128,
+    pub accumulated_protocol_fees_sf: u128,
+    pub pending_referrer_fees_sf: u128,
+    pub accumulated_referrer_fees_sf: u128,
 }
-
-pub fn quote(
-    state: &KlendState,
-    wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    if params.amount == 0 {
-        return Err(OverpassError::InvalidAmount);
-    }
-    if !matches!(params.swap_mode, SwapMode::ExactIn) {
-        return Err(OverpassError::UnsupportedSwapMode);
-    }
-
-    let direction = crate::common::direction::from_quote(wv, params)?;
-
-    if state.emergency_mode {
-        return Err(OverpassError::GlobalEmergencyMode);
-    }
-    if state.version != PROGRAM_VERSION {
-        return Err(OverpassError::ReserveDeprecated);
-    }
-    if matches!(direction, Direction::Deposit) {
-        if state.status != 0 {
-            return Err(OverpassError::ReserveObsolete);
-        }
-        if state.block_ctoken_usage {
-            return Err(OverpassError::CTokenUsageBlocked);
-        }
-    }
-
-    let accrued = accrue_interest(state, ctx);
-    let total_supply_f = total_supply_fraction(state, &accrued);
-    let collateral_supply = state.collateral_mint_total_supply;
-
-    match direction {
-        Direction::Deposit => quote_deposit(state, wv, ctx, params, total_supply_f, collateral_supply),
-        Direction::Withdraw => quote_withdraw(state, wv, ctx, params, total_supply_f, collateral_supply),
-    }
-}
-
 
 fn lookup_borrow_rate(curve: &[u8; BORROW_RATE_CURVE_LEN], utilization: Fraction) -> Fraction {
     let utilization = if utilization > Fraction::ONE {
@@ -75,10 +27,10 @@ fn lookup_borrow_rate(curve: &[u8; BORROW_RATE_CURVE_LEN], utilization: Fraction
     } else {
         utilization
     };
-    let util_bps: u32 = (utilization * Fraction::from_num(FULL_BPS))
+    let util_bps_u32: u32 = (utilization * Fraction::from_num(FULL_BPS))
         .round()
         .to_num();
-    let util_bps = util_bps.min(FULL_BPS);
+    let util_bps = util_bps_u32.min(FULL_BPS);
 
     let point = |i: usize| -> (u32, u32) {
         let off = i * POINT_SIZE;
@@ -102,21 +54,14 @@ fn lookup_borrow_rate(curve: &[u8; BORROW_RATE_CURVE_LEN], utilization: Fraction
             return bps_to_fraction(cur_rate);
         }
         if util_bps > prev_util && util_bps < cur_util {
-            let span = (cur_util - prev_util) as u128;
-            let frac = ((util_bps - prev_util) as u128) * (1u128 << 60) / span;
-            let delta_rate_bps = (cur_rate as i128) - (prev_rate as i128);
-            let prev_rate_f = bps_to_fraction(prev_rate);
-            if delta_rate_bps == 0 {
-                return prev_rate_f;
-            }
-            let frac_f = Fraction::from_bits(frac);
-            let abs_delta: u32 = delta_rate_bps.unsigned_abs().try_into().unwrap_or(u32::MAX);
-            let delta_f = bps_to_fraction(abs_delta);
-            return if delta_rate_bps >= 0 {
-                prev_rate_f + frac_f * delta_f
-            } else {
-                prev_rate_f - frac_f * delta_f
-            };
+            let slope_nom = cur_rate.saturating_sub(prev_rate);
+            let slope_denom = cur_util - prev_util;
+            let start_util_f = bps_to_fraction(prev_util);
+            let coef = utilization - start_util_f;
+            let nom = coef * u128::from(slope_nom);
+            let base_rate = nom / u128::from(slope_denom);
+            let offset = bps_to_fraction(prev_rate);
+            return base_rate + offset;
         }
         prev_util = cur_util;
         prev_rate = cur_rate;
@@ -124,19 +69,37 @@ fn lookup_borrow_rate(curve: &[u8; BORROW_RATE_CURVE_LEN], utilization: Fraction
     bps_to_fraction(prev_rate)
 }
 
-fn total_supply_fraction_pre(state: &KlendState) -> Fraction {
-    Fraction::from_num(state.total_available_amount) + Fraction::from_bits(state.borrowed_amount_sf)
-        - Fraction::from_bits(state.accumulated_protocol_fees_sf)
-        - Fraction::from_bits(state.accumulated_referrer_fees_sf)
-        - Fraction::from_bits(state.pending_referrer_fees_sf)
+fn total_supply_core(
+    total_available_amount: u64,
+    borrowed_amount_sf: u128,
+    accumulated_protocol_fees_sf: u128,
+    accumulated_referrer_fees_sf: u128,
+    pending_referrer_fees_sf: u128,
+) -> Fraction {
+    Fraction::from_num(total_available_amount) + Fraction::from_bits(borrowed_amount_sf)
+        - Fraction::from_bits(accumulated_protocol_fees_sf)
+        - Fraction::from_bits(accumulated_referrer_fees_sf)
+        - Fraction::from_bits(pending_referrer_fees_sf)
 }
 
-pub(crate) fn total_supply_fraction(state: &KlendState, accrued: &AccruedKlend) -> Fraction {
-    Fraction::from_num(state.total_available_amount)
-        + Fraction::from_bits(accrued.borrowed_amount_sf)
-        - Fraction::from_bits(accrued.accumulated_protocol_fees_sf)
-        - Fraction::from_bits(accrued.accumulated_referrer_fees_sf)
-        - Fraction::from_bits(accrued.pending_referrer_fees_sf)
+fn total_supply_fraction_pre(state: &KlendState) -> Fraction {
+    total_supply_core(
+        state.total_available_amount,
+        state.borrowed_amount_sf,
+        state.accumulated_protocol_fees_sf,
+        state.accumulated_referrer_fees_sf,
+        state.pending_referrer_fees_sf,
+    )
+}
+
+pub fn total_supply_fraction(state: &KlendState, accrued: &AccruedKlend) -> Fraction {
+    total_supply_core(
+        state.total_available_amount,
+        accrued.borrowed_amount_sf,
+        accrued.accumulated_protocol_fees_sf,
+        accrued.accumulated_referrer_fees_sf,
+        accrued.pending_referrer_fees_sf,
+    )
 }
 
 fn utilization_rate(borrowed_sf: u128, total_supply: Fraction) -> Fraction {
@@ -146,8 +109,8 @@ fn utilization_rate(borrowed_sf: u128, total_supply: Fraction) -> Fraction {
     Fraction::from_bits(borrowed_sf) / total_supply
 }
 
-pub(crate) fn accrue_interest(state: &KlendState, ctx: &QuoteCtx) -> AccruedKlend {
-    let slots_elapsed = ctx.current_slot.saturating_sub(state.last_update_slot);
+pub fn accrue_interest(state: &KlendState, current_slot: u64) -> AccruedKlend {
+    let slots_elapsed = current_slot.saturating_sub(state.last_update_slot);
     if slots_elapsed == 0 {
         return AccruedKlend {
             borrowed_amount_sf: state.borrowed_amount_sf,
@@ -164,8 +127,10 @@ pub(crate) fn accrue_interest(state: &KlendState, ctx: &QuoteCtx) -> AccruedKlen
     let protocol_take_rate = percent_to_fraction(state.protocol_take_rate_pct);
     let referral_rate = Fraction::ZERO;
 
-    let compounded_interest_rate =
-        approximate_compounded_interest(current_borrow_rate + host_fixed_interest_rate, slots_elapsed);
+    let compounded_interest_rate = approximate_compounded_interest(
+        current_borrow_rate + host_fixed_interest_rate,
+        slots_elapsed,
+    );
     let compounded_fixed_rate =
         approximate_compounded_interest(host_fixed_interest_rate, slots_elapsed);
 
@@ -190,7 +155,7 @@ pub(crate) fn accrue_interest(state: &KlendState, ctx: &QuoteCtx) -> AccruedKlen
     }
 }
 
-pub(crate) fn exchange_rate_pair(collateral_supply: u64, total_supply: Fraction) -> (u128, Fraction) {
+pub fn exchange_rate_pair(collateral_supply: u64, total_supply: Fraction) -> (u128, Fraction) {
     if collateral_supply == 0 || total_supply == Fraction::ZERO {
         (1, Fraction::ONE)
     } else {
@@ -206,9 +171,9 @@ fn liquidity_to_collateral(
     let lhs = collateral_supply
         .checked_mul(liquidity_amount as u128)
         .ok_or(OverpassError::MathOverflow)?;
-    let big = BigFraction::from_num(lhs);
+    let big = BigFraction::from_num(lhs).ok_or(OverpassError::MathOverflow)?;
     let rhs = BigFraction::from(total_supply);
-    let result = big / rhs;
+    let result = big.checked_div(rhs).ok_or(OverpassError::MathOverflow)?;
     let fraction = result
         .try_into_fraction()
         .ok_or(OverpassError::MathOverflow)?;
@@ -228,13 +193,17 @@ fn collateral_to_liquidity_ceil(
     let liquidity_sbf = U256::from(total_supply.to_bits());
     let cs = U256::from(collateral_supply);
 
-    let product = coll.checked_mul(liquidity_sbf).ok_or(OverpassError::MathOverflow)?;
+    let product = coll
+        .checked_mul(liquidity_sbf)
+        .ok_or(OverpassError::MathOverflow)?;
     let numerator = product
         .checked_add(cs - U256::one())
         .ok_or(OverpassError::MathOverflow)?;
     let quotient = numerator / cs;
 
-    let bits: u128 = quotient.try_into().map_err(|_| OverpassError::MathOverflow)?;
+    let bits: u128 = quotient
+        .try_into()
+        .map_err(|_| OverpassError::MathOverflow)?;
     let fraction = Fraction::from_bits(bits);
     let ceiled: u128 = fraction.ceil().to_num();
     u128_to_u64(ceiled)
@@ -252,16 +221,20 @@ fn collateral_to_liquidity(
     let liquidity_sbf = U256::from(total_supply.to_bits());
     let cs = U256::from(collateral_supply);
 
-    let product = coll.checked_mul(liquidity_sbf).ok_or(OverpassError::MathOverflow)?;
+    let product = coll
+        .checked_mul(liquidity_sbf)
+        .ok_or(OverpassError::MathOverflow)?;
     let quotient = product / cs;
 
-    let bits: u128 = quotient.try_into().map_err(|_| OverpassError::MathOverflow)?;
+    let bits: u128 = quotient
+        .try_into()
+        .map_err(|_| OverpassError::MathOverflow)?;
     let fraction = Fraction::from_bits(bits);
     let floored: u128 = fraction.floor().to_num();
     u128_to_u64(floored)
 }
 
-pub(crate) fn fraction_collateral_to_liquidity(
+pub fn fraction_collateral_to_liquidity(
     collateral_amount: u64,
     collateral_supply: u128,
     total_supply: Fraction,
@@ -272,23 +245,68 @@ pub(crate) fn fraction_collateral_to_liquidity(
     let coll = U256::from(collateral_amount);
     let liquidity_sbf = U256::from(total_supply.to_bits());
     let cs = U256::from(collateral_supply);
-    let product = coll.checked_mul(liquidity_sbf).ok_or(OverpassError::MathOverflow)?;
+    let product = coll
+        .checked_mul(liquidity_sbf)
+        .ok_or(OverpassError::MathOverflow)?;
     let quotient = product / cs;
-    let bits: u128 = quotient.try_into().map_err(|_| OverpassError::MathOverflow)?;
+    let bits: u128 = quotient
+        .try_into()
+        .map_err(|_| OverpassError::MathOverflow)?;
     Ok(Fraction::from_bits(bits))
 }
 
-fn quote_deposit(
-    state: &KlendState,
-    wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
+pub fn fraction_liquidity_to_collateral_ceil(
+    liquidity_amount: u64,
+    collateral_supply: u128,
     total_supply: Fraction,
-    collateral_supply: u64,
-) -> Result<Quote, OverpassError> {
-    let amount = params.amount;
+) -> Result<u64, OverpassError> {
+    if collateral_supply == 0 {
+        return Err(OverpassError::MathOverflow);
+    }
+    let den = U256::from(total_supply.to_bits());
+    if den.is_zero() {
+        return Err(OverpassError::MathOverflow);
+    }
+    let num = U256::from(liquidity_amount)
+        .checked_mul(U256::from(collateral_supply))
+        .ok_or(OverpassError::MathOverflow)?
+        .checked_mul(U256::from(1u128 << 60))
+        .ok_or(OverpassError::MathOverflow)?;
+    let quotient = (num + den - U256::one()) / den;
+    let v: u128 = quotient
+        .try_into()
+        .map_err(|_| OverpassError::MathOverflow)?;
+    u128_to_u64(v)
+}
 
-    let protocol_fee = mul_bps(amount, ctx.protocol_deposit_fee_bps)?;
+pub fn quote_deposit(
+    state: &KlendState,
+    current_slot: u64,
+    wv: &WrapperVault,
+    gc: &GlobalConfig,
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(OverpassError::InvalidAmount);
+    }
+    if state.emergency_mode {
+        return Err(OverpassError::GlobalEmergencyMode);
+    }
+    if state.version != PROGRAM_VERSION {
+        return Err(OverpassError::ReserveDeprecated);
+    }
+    if state.status != 0 {
+        return Err(OverpassError::ReserveObsolete);
+    }
+    if state.block_ctoken_usage {
+        return Err(OverpassError::CTokenUsageBlocked);
+    }
+
+    let accrued = accrue_interest(state, current_slot);
+    let total_supply_f = total_supply_fraction(state, &accrued);
+    let collateral_supply = state.collateral_mint_total_supply;
+
+    let protocol_fee = mul_bps(amount, gc.protocol_deposit_fee_bps)?;
     let creator_fee = mul_bps(amount, wv.creator_deposit_fee_bps)?;
     let net_amount = amount
         .checked_sub(protocol_fee)
@@ -298,7 +316,7 @@ fn quote_deposit(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let (cs, ts) = exchange_rate_pair(collateral_supply, total_supply);
+    let (cs, ts) = exchange_rate_pair(collateral_supply, total_supply_f);
 
     let collateral_amount = liquidity_to_collateral(net_amount, cs, ts)?;
     if collateral_amount == 0 {
@@ -309,8 +327,7 @@ fn quote_deposit(
         return Err(OverpassError::MathOverflow);
     }
 
-    let new_supply_f =
-        Fraction::from_num(liquidity_amount_to_deposit) + total_supply;
+    let new_supply_f = Fraction::from_num(liquidity_amount_to_deposit) + total_supply_f;
     if new_supply_f > Fraction::from_num(state.deposit_limit) {
         return Err(OverpassError::DepositLimitExceeded);
     }
@@ -335,31 +352,39 @@ fn quote_deposit(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let total_fee = protocol_fee
-        .checked_add(creator_fee)
+    let new_intermediate = prev_intermediate
+        .checked_add(collateral_amount as u128)
         .ok_or(OverpassError::MathOverflow)?;
-    let fee_pct_bps = ctx.protocol_deposit_fee_bps as i64 + wv.creator_deposit_fee_bps as i64;
-    let fee_pct = Decimal::new(fee_pct_bps, 4);
+    let new_wrapper_supply = wrapper_supply
+        .checked_add(wrapper_to_mint)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        prev_intermediate,
+        wrapper_supply,
+        new_intermediate,
+        new_wrapper_supply,
+    )?;
 
-    Ok(Quote {
-        in_amount: amount,
-        out_amount: wrapper_to_mint,
-        fee_amount: total_fee,
-        fee_mint: wv.underlying_mint,
-        fee_pct,
-    })
+    Ok(wrapper_to_mint)
 }
 
-fn quote_withdraw(
+pub fn quote_withdraw(
     state: &KlendState,
+    current_slot: u64,
+    unix_timestamp: i64,
     wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-    total_supply: Fraction,
-    collateral_supply: u64,
-) -> Result<Quote, OverpassError> {
-    let burn_amount = params.amount;
-    if burn_amount > wv.wrapper_supply {
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(OverpassError::InvalidAmount);
+    }
+    if state.emergency_mode {
+        return Err(OverpassError::GlobalEmergencyMode);
+    }
+    if state.version != PROGRAM_VERSION {
+        return Err(OverpassError::ReserveDeprecated);
+    }
+    if amount > wv.wrapper_supply {
         return Err(OverpassError::BurnExceedsWrapperSupply);
     }
 
@@ -368,7 +393,7 @@ fn quote_withdraw(
         return Err(OverpassError::InvalidState("klend: no cTokens"));
     }
     let ctokens_to_redeem = u128_to_u64(
-        (burn_amount as u128)
+        (amount as u128)
             .checked_mul(total_ctokens)
             .ok_or(OverpassError::MathOverflow)?
             .checked_div(wv.wrapper_supply as u128)
@@ -378,7 +403,9 @@ fn quote_withdraw(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let (cs, ts) = exchange_rate_pair(collateral_supply, total_supply);
+    let accrued = accrue_interest(state, current_slot);
+    let total_supply_f = total_supply_fraction(state, &accrued);
+    let (cs, ts) = exchange_rate_pair(state.collateral_mint_total_supply, total_supply_f);
 
     let underlying_received = collateral_to_liquidity(ctokens_to_redeem, cs, ts)?;
     if underlying_received == 0 {
@@ -397,18 +424,27 @@ fn quote_withdraw(
         return Err(OverpassError::InsufficientLiquidity);
     }
 
-
-    let remaining =
-        withdrawal_caps::remaining_amount(&state.deposit_withdrawal_cap, ctx.unix_timestamp);
+    let remaining = withdrawal_caps::remaining_amount(
+        &state.deposit_withdrawal_cap,
+        unix_timestamp.max(0) as u64,
+    );
     if underlying_received > remaining {
         return Err(OverpassError::WithdrawalCapReached);
     }
 
-    Ok(Quote {
-        in_amount: burn_amount,
-        out_amount: underlying_received,
-        fee_amount: 0,
-        fee_mint: wv.underlying_mint,
-        fee_pct: Decimal::ZERO,
-    })
+    let new_intermediate = total_ctokens
+        .checked_sub(ctokens_to_redeem as u128)
+        .ok_or(OverpassError::MathOverflow)?;
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_sub(amount)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        total_ctokens,
+        wv.wrapper_supply,
+        new_intermediate,
+        new_wrapper_supply,
+    )?;
+
+    Ok(underlying_received)
 }

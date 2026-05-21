@@ -1,5 +1,3 @@
-//! Port of <https://github.com/Kamino-Finance/klend> @ `3f7bd69`.
-
 use solana_program::pubkey::Pubkey;
 
 use crate::error::OverpassError;
@@ -89,7 +87,9 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
         return Err(OverpassError::InvalidAccount("klend reserve: length"));
     }
     if data[..8] != RESERVE_DISCRIMINATOR {
-        return Err(OverpassError::InvalidAccount("klend reserve: discriminator"));
+        return Err(OverpassError::InvalidAccount(
+            "klend reserve: discriminator",
+        ));
     }
 
     let version = read_u64(data, 8, "klend.version")?;
@@ -100,8 +100,7 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
     let supply_vault = read_pubkey(data, 160, "klend.liquidity.supply_vault")?;
     let total_available_amount = read_u64(data, 224, "klend.total_available_amount")?;
     let borrowed_amount_sf = read_u128(data, 232, "klend.borrowed_amount_sf")?;
-    let market_price_last_updated_ts =
-        read_u64(data, 264, "klend.market_price_last_updated_ts")?;
+    let market_price_last_updated_ts = read_u64(data, 264, "klend.market_price_last_updated_ts")?;
     let mint_decimals = read_u64(data, 272, "klend.mint_decimals")?;
 
     let mut cumulative_borrow_rate_bsf = [0u64; 6];
@@ -109,24 +108,20 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
         *slot = read_u64(data, 296 + i * 8, "klend.cumulative_borrow_rate_bsf")?;
     }
 
-    let accumulated_protocol_fees_sf =
-        read_u128(data, 344, "klend.accumulated_protocol_fees_sf")?;
-    let accumulated_referrer_fees_sf =
-        read_u128(data, 360, "klend.accumulated_referrer_fees_sf")?;
+    let accumulated_protocol_fees_sf = read_u128(data, 344, "klend.accumulated_protocol_fees_sf")?;
+    let accumulated_referrer_fees_sf = read_u128(data, 360, "klend.accumulated_referrer_fees_sf")?;
     let pending_referrer_fees_sf = read_u128(data, 376, "klend.pending_referrer_fees_sf")?;
     let absolute_referral_rate_sf = read_u128(data, 392, "klend.absolute_referral_rate_sf")?;
     let liquidity_token_program = read_pubkey(data, 408, "klend.liquidity.token_program")?;
 
     let collateral_mint_pubkey = read_pubkey(data, 2560, "klend.collateral.mint_pubkey")?;
-    let collateral_mint_total_supply =
-        read_u64(data, 2592, "klend.collateral.mint_total_supply")?;
+    let collateral_mint_total_supply = read_u64(data, 2592, "klend.collateral.mint_total_supply")?;
 
     let status = data[4856];
-    let host_fixed_interest_rate_bps = u16::from_le_bytes(
-        data[4858..4860]
-            .try_into()
-            .map_err(|_| OverpassError::InvalidAccount("klend.config.host_fixed_interest_rate_bps"))?,
-    );
+    let host_fixed_interest_rate_bps =
+        u16::from_le_bytes(data[4858..4860].try_into().map_err(|_| {
+            OverpassError::InvalidAccount("klend.config.host_fixed_interest_rate_bps")
+        })?);
     let block_ctoken_usage = data[4862] != 0;
     let emergency_mode = data[4864] != 0;
     let protocol_take_rate_pct = data[4870];
@@ -137,8 +132,7 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
 
     let deposit_limit = read_u64(data, 5016, "klend.config.deposit_limit")?;
 
-    let max_age_price_seconds =
-        read_u64(data, 5096, "klend.token_info.max_age_price_seconds")?;
+    let max_age_price_seconds = read_u64(data, 5096, "klend.token_info.max_age_price_seconds")?;
     let scope_price_feed = read_pubkey(data, 5112, "klend.token_info.scope_price_feed")?;
     let switchboard_price_aggregator =
         read_pubkey(data, 5160, "klend.token_info.switchboard_price_aggregator")?;
@@ -148,7 +142,8 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
 
     let deposit_withdrawal_cap = withdrawal_caps::decode(&data[5416..5448])?;
     let debt_withdrawal_cap = withdrawal_caps::decode(&data[5448..5480])?;
-    let queued_collateral_amount = read_u64(data, 6968, "klend.withdraw_queue.queued_collateral_amount")?;
+    let queued_collateral_amount =
+        read_u64(data, 6968, "klend.withdraw_queue.queued_collateral_amount")?;
 
     Ok(KlendState {
         version,

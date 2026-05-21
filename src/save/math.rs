@@ -1,41 +1,10 @@
-//! Port of <https://github.com/solendprotocol/solana-program-library>.
-
-use jupiter_amm_interface::{Quote, QuoteParams, SwapMode};
-use rust_decimal::Decimal;
-
 use super::state::SaveState;
-use crate::common::checked::{mul_bps, u128_to_u64};
-use crate::common::direction::Direction;
-use crate::error::OverpassError;
 use super::wad::{self, Wad, WAD};
-use crate::accounts::WrapperVault;
-use crate::QuoteCtx;
+use crate::accounts::{GlobalConfig, WrapperVault};
+use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64};
+use crate::error::OverpassError;
 
 const INITIAL_COLLATERAL_RATE: Wad = WAD;
-
-pub fn quote(
-    state: &SaveState,
-    wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    if params.amount == 0 {
-        return Err(OverpassError::InvalidAmount);
-    }
-    if !matches!(params.swap_mode, SwapMode::ExactIn) {
-        return Err(OverpassError::UnsupportedSwapMode);
-    }
-    let direction = crate::common::direction::from_quote(wv, params)?;
-
-    let accrued = accrue_interest(state, ctx)?;
-    let total_supply_w = total_supply_wad(state, &accrued)?;
-    let exchange_rate_w = exchange_rate(state.collateral_mint_total_supply, total_supply_w)?;
-
-    match direction {
-        Direction::Deposit => quote_deposit(state, wv, ctx, params, total_supply_w, exchange_rate_w),
-        Direction::Withdraw => quote_withdraw(state, wv, params, exchange_rate_w),
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 struct AccruedSave {
@@ -43,8 +12,8 @@ struct AccruedSave {
     accumulated_protocol_fees_wads: Wad,
 }
 
-fn accrue_interest(state: &SaveState, ctx: &QuoteCtx) -> Result<AccruedSave, OverpassError> {
-    let slots_elapsed = ctx.current_slot.saturating_sub(state.last_update_slot);
+fn accrue_interest(state: &SaveState, current_slot: u64) -> Result<AccruedSave, OverpassError> {
+    let slots_elapsed = current_slot.saturating_sub(state.last_update_slot);
     if slots_elapsed == 0 || state.borrowed_amount_wads == 0 {
         return Ok(AccruedSave {
             borrowed_amount_wads: state.borrowed_amount_wads,
@@ -52,8 +21,8 @@ fn accrue_interest(state: &SaveState, ctx: &QuoteCtx) -> Result<AccruedSave, Ove
         });
     }
 
-    let current_borrow_rate = current_borrow_rate(state)?;
-    let slot_interest_rate = current_borrow_rate / wad::SLOTS_PER_YEAR as u128;
+    let borrow_rate = current_borrow_rate(state)?;
+    let slot_interest_rate = borrow_rate / wad::SLOTS_PER_YEAR as u128;
     let one_plus_slot_rate = WAD.saturating_add(slot_interest_rate);
     let compounded = wad::wad_pow(one_plus_slot_rate, slots_elapsed)?;
 
@@ -162,17 +131,22 @@ fn collateral_to_liquidity(collateral: u64, rate_w: Wad) -> Result<u64, Overpass
     Ok(wad::to_floor_u64(quot))
 }
 
-fn quote_deposit(
+pub fn quote_deposit(
     state: &SaveState,
+    current_slot: u64,
     wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-    total_supply_w: Wad,
-    exchange_rate_w: Wad,
-) -> Result<Quote, OverpassError> {
-    let amount = params.amount;
+    gc: &GlobalConfig,
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(OverpassError::InvalidAmount);
+    }
 
-    let protocol_fee = mul_bps(amount, ctx.protocol_deposit_fee_bps)?;
+    let accrued = accrue_interest(state, current_slot)?;
+    let total_supply_w = total_supply_wad(state, &accrued)?;
+    let exchange_rate_w = exchange_rate(state.collateral_mint_total_supply, total_supply_w)?;
+
+    let protocol_fee = mul_bps(amount, gc.protocol_deposit_fee_bps)?;
     let creator_fee = mul_bps(amount, wv.creator_deposit_fee_bps)?;
     let net_amount = amount
         .checked_sub(protocol_fee)
@@ -214,37 +188,44 @@ fn quote_deposit(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let total_fee = protocol_fee
-        .checked_add(creator_fee)
+    let new_intermediate = prev_intermediate
+        .checked_add(collateral_received as u128)
         .ok_or(OverpassError::MathOverflow)?;
-    let fee_pct_bps = ctx.protocol_deposit_fee_bps as i64 + wv.creator_deposit_fee_bps as i64;
-    let fee_pct = Decimal::new(fee_pct_bps, 4);
+    let new_wrapper_supply = wrapper_supply
+        .checked_add(wrapper_to_mint)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        prev_intermediate,
+        wrapper_supply,
+        new_intermediate,
+        new_wrapper_supply,
+    )?;
 
-    Ok(Quote {
-        in_amount: amount,
-        out_amount: wrapper_to_mint,
-        fee_amount: total_fee,
-        fee_mint: wv.underlying_mint,
-        fee_pct,
-    })
+    Ok(wrapper_to_mint)
 }
 
-fn quote_withdraw(
+pub fn quote_withdraw(
     state: &SaveState,
+    current_slot: u64,
     wv: &WrapperVault,
-    params: &QuoteParams,
-    exchange_rate_w: Wad,
-) -> Result<Quote, OverpassError> {
-    let burn_amount = params.amount;
-    if burn_amount > wv.wrapper_supply {
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(OverpassError::InvalidAmount);
+    }
+    if amount > wv.wrapper_supply {
         return Err(OverpassError::BurnExceedsWrapperSupply);
     }
     if wv.intermediate_held == 0 {
         return Err(OverpassError::InvalidState("save: no cTokens"));
     }
 
+    let accrued = accrue_interest(state, current_slot)?;
+    let total_supply_w = total_supply_wad(state, &accrued)?;
+    let exchange_rate_w = exchange_rate(state.collateral_mint_total_supply, total_supply_w)?;
+
     let ctokens_to_redeem = u128_to_u64(
-        (burn_amount as u128)
+        (amount as u128)
             .checked_mul(wv.intermediate_held)
             .ok_or(OverpassError::MathOverflow)?
             .checked_div(wv.wrapper_supply as u128)
@@ -263,11 +244,20 @@ fn quote_withdraw(
         return Err(OverpassError::InsufficientLiquidity);
     }
 
-    Ok(Quote {
-        in_amount: burn_amount,
-        out_amount: underlying_received,
-        fee_amount: 0,
-        fee_mint: wv.underlying_mint,
-        fee_pct: Decimal::ZERO,
-    })
+    let new_intermediate = wv
+        .intermediate_held
+        .checked_sub(ctokens_to_redeem as u128)
+        .ok_or(OverpassError::MathOverflow)?;
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_sub(amount)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        wv.intermediate_held,
+        wv.wrapper_supply,
+        new_intermediate,
+        new_wrapper_supply,
+    )?;
+
+    Ok(underlying_received)
 }

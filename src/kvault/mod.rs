@@ -26,5 +26,5 @@ pub fn accounts_len(state: &KvaultState, _wv: &crate::accounts::WrapperVault) ->
 }
 
 pub fn is_active(_state: &KvaultState) -> bool {
-    false
+    true
 }

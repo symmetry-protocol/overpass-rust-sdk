@@ -2,12 +2,36 @@ use jupiter_amm_interface::AccountMap;
 use solana_program::pubkey::Pubkey;
 
 use super::state::{self, KvaultState, GLOBAL_CONFIG_SEED, PD_OFF_UNDERLYING_TOKEN_KIND};
+use crate::accounts::WrapperVault;
+use crate::common::bytes::{read_pubkey, read_u128, read_u64};
+use crate::common::programs::{derive_ata, SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
 use crate::error::OverpassError;
 use crate::klend;
-use crate::accounts::WrapperVault;
-use crate::common::programs::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
 
+use super::account_metas::FARMS_PROGRAM_ID;
 use super::KVAULT_PROGRAM_ID;
+
+const FARMS_USER_ACTIVE_STAKE_SCALED_OFFSET: usize = 408;
+const FARMS_USER_STATE_LEN: usize = 920;
+const SPL_TOKEN_AMOUNT_OFFSET: usize = 64;
+
+fn farm_position_keys(wv: &WrapperVault) -> Result<(Pubkey, Pubkey), OverpassError> {
+    let (vault_authority, _) = Pubkey::find_program_address(
+        &[b"authority", wv.wrapper_mint.as_ref()],
+        &crate::OVERPASS_PROGRAM_ID,
+    );
+    let kvault_share_mint = read_pubkey(&wv.protocol_data, 0, "kvault.pd.share_mint")?;
+    let vault_shares_ata = derive_ata(&vault_authority, &kvault_share_mint, &SPL_TOKEN_PROGRAM_ID);
+    let (farms_user_state, _) = Pubkey::find_program_address(
+        &[
+            b"user",
+            wv.source_position_pda.as_ref(),
+            vault_authority.as_ref(),
+        ],
+        &FARMS_PROGRAM_ID,
+    );
+    Ok((vault_shares_ata, farms_user_state))
+}
 
 pub fn accounts_to_update(state: &KvaultState, wv: &WrapperVault) -> Vec<Pubkey> {
     let (kvault_global_config, _) =
@@ -18,6 +42,10 @@ pub fn accounts_to_update(state: &KvaultState, wv: &WrapperVault) -> Vec<Pubkey>
     }
     if wv.protocol_data[48] != 0 {
         accts.push(wv.source_position_pda);
+        if let Ok((vault_shares_ata, farms_user_state)) = farm_position_keys(wv) {
+            accts.push(vault_shares_ata);
+            accts.push(farms_user_state);
+        }
     }
     accts
 }
@@ -65,6 +93,39 @@ pub fn update(
             new_state.cached_farm_state = state.cached_farm_state;
         }
     }
+
+    new_state.position_kvault_shares = if wv.protocol_data[48] != 0 {
+        let (vault_shares_ata, farms_user_state) = farm_position_keys(wv)?;
+        let idle = match account_map.get(&vault_shares_ata) {
+            Some(a) => read_u64(&a.data, SPL_TOKEN_AMOUNT_OFFSET, "shares_ata.amount")?,
+            None => 0,
+        };
+        let user_stake_scaled = match account_map.get(&farms_user_state) {
+            Some(a) if a.owner == FARMS_PROGRAM_ID && a.data.len() >= FARMS_USER_STATE_LEN => {
+                read_u128(
+                    &a.data,
+                    FARMS_USER_ACTIVE_STAKE_SCALED_OFFSET,
+                    "farms_user.active_stake_scaled",
+                )?
+            }
+            _ => 0,
+        };
+        let fm = new_state
+            .cached_farm_state
+            .ok_or(OverpassError::InvalidState(
+                "kvault: use_farms but FarmState not cached",
+            ))?;
+        let farm_kt = state::convert_stake_to_amount(
+            user_stake_scaled,
+            fm.total_active_stake_scaled,
+            fm.total_staked_amount,
+        )?;
+        (idle as u128)
+            .checked_add(farm_kt as u128)
+            .ok_or(OverpassError::MathOverflow)?
+    } else {
+        wv.intermediate_held
+    };
 
     new_state.underlying_token_program = if wv.protocol_data[PD_OFF_UNDERLYING_TOKEN_KIND] == 1 {
         TOKEN_2022_PROGRAM_ID

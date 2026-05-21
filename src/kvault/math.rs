@@ -1,48 +1,26 @@
-//! Port of <https://github.com/Kamino-Finance/kvault>.
-
-use jupiter_amm_interface::{Quote, QuoteParams, SwapMode};
-use rust_decimal::Decimal;
-
 use super::state::{ActiveAllocation, KvaultState};
-use crate::common::checked::{mul_bps, mul_div_u64, u128_to_u64, FULL_BPS};
-use crate::error::OverpassError;
-use crate::klend::fraction::Fraction;
+use crate::accounts::{GlobalConfig, WrapperVault};
+use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64, FULL_BPS};
 use crate::common::u256::U256;
+use crate::error::OverpassError;
 use crate::klend;
-use crate::accounts::WrapperVault;
-use crate::QuoteCtx;
+use crate::klend::fraction::Fraction;
 
 const SECONDS_PER_YEAR: u128 = 31_556_926;
 
-pub fn quote(
+pub fn quote_deposit(
     state: &KvaultState,
+    current_slot: u64,
+    unix_timestamp: i64,
     wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    if params.swap_mode != SwapMode::ExactIn {
-        return Err(OverpassError::UnsupportedSwapMode);
-    }
-    if params.amount == 0 {
+    gc: &GlobalConfig,
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
         return Err(OverpassError::InvalidAmount);
     }
-    if params.input_mint == wv.underlying_mint && params.output_mint == wv.wrapper_mint {
-        quote_deposit(state, wv, ctx, params)
-    } else if params.input_mint == wv.wrapper_mint && params.output_mint == wv.underlying_mint {
-        quote_withdraw(state, wv, ctx, params)
-    } else {
-        Err(OverpassError::InvalidState("kvault: mint pair mismatch"))
-    }
-}
 
-fn quote_deposit(
-    state: &KvaultState,
-    wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    let amount = params.amount;
-    let protocol_fee = mul_bps(amount, ctx.protocol_deposit_fee_bps)?;
+    let protocol_fee = mul_bps(amount, gc.protocol_deposit_fee_bps)?;
     let creator_fee = mul_bps(amount, wv.creator_deposit_fee_bps)?;
     let total_fee = protocol_fee
         .checked_add(creator_fee)
@@ -69,7 +47,7 @@ fn quote_deposit(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let aum = compute_current_aum(state, ctx)?;
+    let aum = compute_current_aum(state, current_slot, unix_timestamp)?;
     let kvault_shares_to_mint = get_shares_to_mint(aum, max_user_tokens, state.shares_issued)?;
     if kvault_shares_to_mint == 0 {
         return Err(OverpassError::InvalidAmount);
@@ -78,7 +56,7 @@ fn quote_deposit(
     let wrapper_to_mint = if wv.wrapper_supply == 0 {
         net_amount
     } else {
-        if wv.intermediate_held == 0 {
+        if state.position_kvault_shares == 0 {
             return Err(OverpassError::InvalidState(
                 "kvault: wrapper_supply>0 but intermediate_held=0",
             ));
@@ -86,7 +64,7 @@ fn quote_deposit(
         u128_to_u64(
             (kvault_shares_to_mint as u128)
                 .checked_mul(wv.wrapper_supply as u128)
-                .and_then(|x| x.checked_div(wv.intermediate_held))
+                .and_then(|x| x.checked_div(state.position_kvault_shares))
                 .ok_or(OverpassError::MathOverflow)?,
         )?
     };
@@ -94,37 +72,46 @@ fn quote_deposit(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let fee_pct_bps = ctx.protocol_deposit_fee_bps as i64 + wv.creator_deposit_fee_bps as i64;
-    let fee_pct = Decimal::new(fee_pct_bps, 4);
+    let new_total_kvault_shares = wv
+        .intermediate_held
+        .checked_add(kvault_shares_to_mint as u128)
+        .ok_or(OverpassError::MathOverflow)?;
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_add(wrapper_to_mint)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        state.position_kvault_shares,
+        wv.wrapper_supply,
+        new_total_kvault_shares,
+        new_wrapper_supply,
+    )?;
 
-    Ok(Quote {
-        in_amount: amount,
-        out_amount: wrapper_to_mint,
-        fee_amount: total_fee,
-        fee_mint: wv.underlying_mint,
-        fee_pct,
-    })
+    Ok(wrapper_to_mint)
 }
 
-fn quote_withdraw(
+pub fn quote_withdraw(
     state: &KvaultState,
+    current_slot: u64,
+    unix_timestamp: i64,
     wv: &WrapperVault,
-    ctx: &QuoteCtx,
-    params: &QuoteParams,
-) -> Result<Quote, OverpassError> {
-    let burn_amount = params.amount;
-    if burn_amount > wv.wrapper_supply {
+    amount: u64,
+) -> Result<u64, OverpassError> {
+    if amount == 0 {
+        return Err(OverpassError::InvalidAmount);
+    }
+    if amount > wv.wrapper_supply {
         return Err(OverpassError::BurnExceedsWrapperSupply);
     }
-    if wv.intermediate_held == 0 {
+    if state.position_kvault_shares == 0 {
         return Err(OverpassError::InvalidState(
             "kvault: intermediate_held=0 on withdraw",
         ));
     }
 
     let shares_to_redeem = u128_to_u64(
-        (burn_amount as u128)
-            .checked_mul(wv.intermediate_held)
+        (amount as u128)
+            .checked_mul(state.position_kvault_shares)
             .and_then(|x| x.checked_div(wv.wrapper_supply as u128))
             .ok_or(OverpassError::MathOverflow)?,
     )?;
@@ -132,7 +119,7 @@ fn quote_withdraw(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let aum = compute_current_aum(state, ctx)?;
+    let aum = compute_current_aum(state, current_slot, unix_timestamp)?;
     if aum == Fraction::ZERO {
         return Err(OverpassError::InvalidState("kvault: aum=0"));
     }
@@ -146,15 +133,15 @@ fn quote_withdraw(
     if total_with_penalty == 0 {
         return Err(OverpassError::InvalidAmount);
     }
-    if total_with_penalty < state.min_withdraw_amount {
-        return Err(OverpassError::InvalidAmount);
-    }
 
     let penalty_bps = state.effective_penalty_bps();
     let penalty_lamports = state.effective_penalty_lamports();
-    let penalty_from_bps =
-        mul_div_u64(total_with_penalty, penalty_bps, FULL_BPS as u64).unwrap_or(0);
-    let penalty = penalty_from_bps.max(penalty_lamports);
+    let bps_prod = (total_with_penalty as u128)
+        .checked_mul(penalty_bps as u128)
+        .ok_or(OverpassError::MathOverflow)?;
+    let denom = FULL_BPS as u128;
+    let penalty_from_bps_ceil = u128_to_u64(bps_prod.div_ceil(denom))?;
+    let penalty = penalty_from_bps_ceil.max(penalty_lamports);
     if penalty >= total_with_penalty {
         return Err(OverpassError::InvalidAmount);
     }
@@ -165,47 +152,109 @@ fn quote_withdraw(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let final_for_user = if total_for_user > state.token_available {
-        total_for_user.saturating_sub(1)
-    } else {
+    let available_to_send: u64 = state.token_available.min(total_for_user);
+    let final_for_user = if total_for_user <= available_to_send {
         total_for_user
+    } else {
+        let to_disinvest = total_for_user
+            .checked_sub(available_to_send)
+            .ok_or(OverpassError::MathOverflow)?;
+        let primary = state
+            .active_allocations
+            .iter()
+            .max_by_key(|a| a.ctoken_allocation)
+            .ok_or(OverpassError::InvalidState("kvault: no active allocations"))?;
+        let reserve = state
+            .cached_reserves
+            .iter()
+            .find(|(k, _)| *k == primary.reserve)
+            .map(|(_, r)| r)
+            .ok_or(OverpassError::AccountMissing(
+                "kvault primary reserve (not in update map)",
+            ))?;
+        let accrued = klend::math::accrue_interest(reserve, current_slot);
+        let total_supply = klend::math::total_supply_fraction(reserve, &accrued);
+        let (cs, ts) =
+            klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);
+        let in_reserve_liq_f =
+            klend::math::fraction_collateral_to_liquidity(primary.ctoken_allocation, cs, ts)?;
+        let send_f = in_reserve_liq_f.min(Fraction::from_num(to_disinvest));
+        if send_f == Fraction::ZERO {
+            available_to_send
+        } else {
+            let send_floor: u64 = send_f.floor().to_num::<u64>();
+            let disinvest_ctokens =
+                klend::math::fraction_liquidity_to_collateral_ceil(send_floor, cs, ts)?
+                    .min(primary.ctoken_allocation);
+            let disinvest_liq_f =
+                klend::math::fraction_collateral_to_liquidity(disinvest_ctokens, cs, ts)?;
+            let rounding_err: u64 = if disinvest_liq_f.frac() > Fraction::ZERO
+                && disinvest_liq_f.frac() > send_f.frac()
+            {
+                1
+            } else {
+                0
+            };
+            let actual = send_floor.saturating_sub(rounding_err);
+            available_to_send
+                .checked_add(actual)
+                .ok_or(OverpassError::MathOverflow)?
+        }
     };
     if final_for_user == 0 {
         return Err(OverpassError::InvalidAmount);
     }
+    if final_for_user <= state.min_withdraw_amount {
+        return Err(OverpassError::InvalidAmount);
+    }
 
-    Ok(Quote {
-        in_amount: burn_amount,
-        out_amount: final_for_user,
-        fee_amount: 0,
-        fee_mint: wv.underlying_mint,
-        fee_pct: Decimal::ZERO,
-    })
+    let new_total_kvault_shares = wv
+        .intermediate_held
+        .checked_sub(shares_to_redeem as u128)
+        .ok_or(OverpassError::MathOverflow)?;
+    let new_wrapper_supply = wv
+        .wrapper_supply
+        .checked_sub(amount)
+        .ok_or(OverpassError::MathOverflow)?;
+    require_no_value_per_share_loss(
+        state.position_kvault_shares,
+        wv.wrapper_supply,
+        new_total_kvault_shares,
+        new_wrapper_supply,
+    )?;
+
+    Ok(final_for_user)
 }
 
-fn compute_current_aum(state: &KvaultState, ctx: &QuoteCtx) -> Result<Fraction, OverpassError> {
-    let invested_total = invested_total(state, ctx)?;
+fn compute_current_aum(
+    state: &KvaultState,
+    current_slot: u64,
+    unix_timestamp: i64,
+) -> Result<Fraction, OverpassError> {
+    let invested_total = invested_total(state, current_slot)?;
     let available = Fraction::from_num(state.token_available);
     let holdings_total = available + invested_total;
-    let pending_fees_after_charge = charged_pending_fees(state, ctx, invested_total)?;
+    let pending_fees_after_charge = charged_pending_fees(state, unix_timestamp, invested_total)?;
 
     if holdings_total < pending_fees_after_charge {
-        return Err(OverpassError::InvalidState("kvault: AUM below pending fees"));
+        return Err(OverpassError::InvalidState(
+            "kvault: AUM below pending fees",
+        ));
     }
     Ok(holdings_total - pending_fees_after_charge)
 }
 
-fn invested_total(state: &KvaultState, ctx: &QuoteCtx) -> Result<Fraction, OverpassError> {
+fn invested_total(state: &KvaultState, current_slot: u64) -> Result<Fraction, OverpassError> {
     let mut total = Fraction::ZERO;
     for alloc in &state.active_allocations {
-        total += invested_for_allocation(state, ctx, alloc)?;
+        total += invested_for_allocation(state, current_slot, alloc)?;
     }
     Ok(total)
 }
 
 fn invested_for_allocation(
     state: &KvaultState,
-    ctx: &QuoteCtx,
+    current_slot: u64,
     alloc: &ActiveAllocation,
 ) -> Result<Fraction, OverpassError> {
     let reserve = state
@@ -217,23 +266,23 @@ fn invested_for_allocation(
             "kvault allocation reserve (not in update map)",
         ))?;
 
-    let accrued = klend::math::accrue_interest(reserve, ctx);
+    let accrued = klend::math::accrue_interest(reserve, current_slot);
     let total_supply = klend::math::total_supply_fraction(reserve, &accrued);
-    let (cs, ts) = klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);
+    let (cs, ts) =
+        klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);
     klend::math::fraction_collateral_to_liquidity(alloc.ctoken_allocation, cs, ts)
 }
 
 fn charged_pending_fees(
     state: &KvaultState,
-    ctx: &QuoteCtx,
+    unix_timestamp: i64,
     invested_total: Fraction,
 ) -> Result<Fraction, OverpassError> {
     if state.last_fee_charge_timestamp == 0 {
         return Ok(state.pending_fees());
     }
-    let seconds_passed = ctx
-        .unix_timestamp
-        .saturating_sub(state.last_fee_charge_timestamp);
+    let now = unix_timestamp.max(0) as u64;
+    let seconds_passed = now.saturating_sub(state.last_fee_charge_timestamp);
 
     let new_aum_preview = {
         let avail = Fraction::from_num(state.token_available);
@@ -311,4 +360,3 @@ fn fraction_full_mul_int_ratio(
 fn bps_to_fraction(bps: u64) -> Fraction {
     Fraction::from_num(bps) / Fraction::from_num(FULL_BPS)
 }
-

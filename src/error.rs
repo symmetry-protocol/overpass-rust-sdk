@@ -5,6 +5,9 @@ pub enum OverpassError {
     #[error("math overflow")]
     MathOverflow,
 
+    #[error("value per share decreased")]
+    ValuePerShareDecreased,
+
     #[error("invalid account: {0}")]
     InvalidAccount(&'static str),
 

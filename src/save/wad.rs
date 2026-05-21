@@ -1,7 +1,5 @@
-//! Port of <https://github.com/solendprotocol/solana-program-library>.
-
-use crate::error::OverpassError;
 use crate::common::u256::U256;
+use crate::error::OverpassError;
 
 pub const WAD: u128 = 1_000_000_000_000_000_000;
 pub const SLOTS_PER_YEAR: u64 = 63_072_000;
@@ -31,9 +29,7 @@ pub fn to_ceil_u64(wad: Wad) -> u64 {
 pub fn wad_mul(a: Wad, b: Wad) -> Result<Wad, OverpassError> {
     let product = U256::from(a) * U256::from(b);
     let scaled = product / U256::from(WAD);
-    scaled
-        .try_into()
-        .map_err(|_| OverpassError::MathOverflow)
+    scaled.try_into().map_err(|_| OverpassError::MathOverflow)
 }
 
 pub fn wad_div(a: Wad, b: Wad) -> Result<Wad, OverpassError> {

@@ -1,5 +1,3 @@
-//! Port of <https://github.com/Kamino-Finance/klend>.
-
 pub use fixed::types::U68F60 as Fraction;
 
 use crate::common::u256::U256;
@@ -16,14 +14,21 @@ impl From<Fraction> for BigFraction {
 }
 
 impl BigFraction {
-    pub fn from_num(num: u128) -> Self {
-        let value = U256::from(num);
-        Self(panicking_shl(value, FRACTION_BITS_SHIFT))
+    pub fn from_num(num: u128) -> Option<Self> {
+        Some(Self(checked_shl(U256::from(num), FRACTION_BITS_SHIFT)?))
     }
 
     pub fn try_into_fraction(self) -> Option<Fraction> {
         let bits: u128 = self.0.try_into().ok()?;
         Some(Fraction::from_bits(bits))
+    }
+
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        if rhs.0.is_zero() {
+            return None;
+        }
+        let extra_scaled = checked_shl(self.0, FRACTION_BITS_SHIFT)?;
+        Some(Self(extra_scaled / rhs.0))
     }
 }
 
@@ -32,14 +37,6 @@ impl core::ops::Mul for BigFraction {
     fn mul(self, rhs: Self) -> Self::Output {
         let extra_scaled = self.0 * rhs.0;
         Self(extra_scaled >> FRACTION_BITS_SHIFT)
-    }
-}
-
-impl core::ops::Div for BigFraction {
-    type Output = Self;
-    fn div(self, rhs: Self) -> Self::Output {
-        let extra_scaled = panicking_shl(self.0, FRACTION_BITS_SHIFT);
-        Self(extra_scaled / rhs.0)
     }
 }
 
@@ -57,15 +54,17 @@ impl core::ops::Sub for BigFraction {
     }
 }
 
-fn panicking_shl(number: U256, bit_count: u32) -> U256 {
+fn checked_shl(number: U256, bit_count: u32) -> Option<U256> {
     let result = number << bit_count;
-    let recovered = result >> bit_count;
-    assert!(recovered == number, "shl overflow");
-    result
+    if result >> bit_count == number {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 pub fn approximate_compounded_interest(rate: Fraction, elapsed_slots: u64) -> Fraction {
-    let slots_per_year: u128 = crate::klend::math::SLOTS_PER_YEAR.into();
+    let slots_per_year: u128 = super::math::SLOTS_PER_YEAR.into();
     let base = rate / slots_per_year;
 
     match elapsed_slots {
@@ -89,14 +88,6 @@ pub fn approximate_compounded_interest(rate: Fraction, elapsed_slots: u64) -> Fr
     let third_term = (second_term * base * exp_minus_two) / 3;
 
     Fraction::ONE + first_term + second_term + third_term
-}
-
-pub fn floor_sf_to_u64(sf: u128) -> u64 {
-    (sf >> FRACTION_BITS_SHIFT) as u64
-}
-
-pub fn u64_to_sf(amount: u64) -> u128 {
-    (amount as u128) << FRACTION_BITS_SHIFT
 }
 
 pub fn bps_to_fraction(bps: u32) -> Fraction {

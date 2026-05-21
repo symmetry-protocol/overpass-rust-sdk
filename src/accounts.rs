@@ -1,5 +1,3 @@
-//! Overpass-program `WrapperVault` + `GlobalConfig` account decoders.
-
 use solana_program::pubkey::Pubkey;
 
 use crate::common::bytes::{read_pubkey, read_u128, read_u16, read_u64};
@@ -73,7 +71,9 @@ pub fn decode_wrapper_vault(data: &[u8]) -> Result<WrapperVault, OverpassError> 
         return Err(OverpassError::InvalidAccount("wrapper_vault: length"));
     }
     if data[..8] != WRAPPER_VAULT_DISCRIMINATOR {
-        return Err(OverpassError::InvalidAccount("wrapper_vault: discriminator"));
+        return Err(OverpassError::InvalidAccount(
+            "wrapper_vault: discriminator",
+        ));
     }
     let version = data[8];
     if version != WRAPPER_VAULT_VERSION {
@@ -125,11 +125,12 @@ pub fn decode_global_config(data: &[u8]) -> Result<GlobalConfig, OverpassError> 
         return Err(OverpassError::InvalidAccount("global_config: length"));
     }
     if data[..8] != GLOBAL_CONFIG_DISCRIMINATOR {
-        return Err(OverpassError::InvalidAccount("global_config: discriminator"));
+        return Err(OverpassError::InvalidAccount(
+            "global_config: discriminator",
+        ));
     }
     let paused = data[9] != 0;
-    let protocol_deposit_fee_bps =
-        read_u16(data, 82, "global_config.protocol_deposit_fee_bps")?;
+    let protocol_deposit_fee_bps = read_u16(data, 82, "global_config.protocol_deposit_fee_bps")?;
     Ok(GlobalConfig {
         paused,
         protocol_deposit_fee_bps,

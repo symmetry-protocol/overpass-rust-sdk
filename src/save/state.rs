@@ -1,9 +1,7 @@
-//! Port of <https://github.com/solendprotocol/solana-program-library>.
-
 use solana_program::pubkey::Pubkey;
 
-use crate::error::OverpassError;
 use super::wad::Wad;
+use crate::error::OverpassError;
 
 pub const RESERVE_LEN: usize = 619;
 

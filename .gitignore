@@ -1,4 +1,10 @@
-/target
-**/*.rs.bk
+/target/
+Cargo.lock
 .DS_Store
-/.cargo
+*.log
+.env
+.env.*
+.idea/
+.vscode/
+/tests/*
+!/tests/smoke.rs

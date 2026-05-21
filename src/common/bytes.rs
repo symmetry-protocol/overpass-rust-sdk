@@ -2,7 +2,11 @@ use solana_program::pubkey::Pubkey;
 
 use crate::error::OverpassError;
 
-pub fn read_pubkey(data: &[u8], offset: usize, label: &'static str) -> Result<Pubkey, OverpassError> {
+pub fn read_pubkey(
+    data: &[u8],
+    offset: usize,
+    label: &'static str,
+) -> Result<Pubkey, OverpassError> {
     let end = offset
         .checked_add(32)
         .ok_or(OverpassError::InvalidAccount(label))?;
@@ -10,6 +14,12 @@ pub fn read_pubkey(data: &[u8], offset: usize, label: &'static str) -> Result<Pu
         return Err(OverpassError::InvalidAccount(label));
     }
     Pubkey::try_from(&data[offset..end]).map_err(|_| OverpassError::InvalidAccount(label))
+}
+
+pub fn read_u8(data: &[u8], offset: usize, label: &'static str) -> Result<u8, OverpassError> {
+    data.get(offset)
+        .copied()
+        .ok_or(OverpassError::InvalidAccount(label))
 }
 
 pub fn read_u16(data: &[u8], offset: usize, label: &'static str) -> Result<u16, OverpassError> {

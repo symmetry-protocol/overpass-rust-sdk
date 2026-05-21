@@ -1,44 +1,44 @@
-use jupiter_amm_interface::SwapParams;
 use solana_program::instruction::AccountMeta;
 use solana_program::pubkey::Pubkey;
 
 use super::state::SaveState;
 use super::SAVE_PROGRAM_ID;
-use crate::error::OverpassError;
-use crate::common::programs::{derive_ata, ATA_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID};
 use crate::accounts::{global_config_pda, WrapperVault};
+use crate::common::programs::{
+    derive_ata, ATA_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID,
+};
+use crate::error::OverpassError;
 
-use crate::common::direction::{from_swap, Direction};
-
-pub fn build(
+fn build_base(
     state: &SaveState,
     wv: &WrapperVault,
-    params: &SwapParams,
+    user: &Pubkey,
 ) -> Result<Vec<AccountMeta>, OverpassError> {
-    let direction = from_swap(wv, params)?;
-
-    let user = params.token_transfer_authority;
     let wrapper_mint = wv.wrapper_mint;
     let underlying_mint = wv.underlying_mint;
     let collateral_mint = state.collateral_mint_pubkey;
 
     let global_config = global_config_pda();
-    let (wrapper_vault_pda, _) =
-        Pubkey::find_program_address(&[b"vault", wrapper_mint.as_ref()], &crate::OVERPASS_PROGRAM_ID);
-    let (vault_authority, _) =
-        Pubkey::find_program_address(&[b"authority", wrapper_mint.as_ref()], &crate::OVERPASS_PROGRAM_ID);
+    let (wrapper_vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", wrapper_mint.as_ref()],
+        &crate::OVERPASS_PROGRAM_ID,
+    );
+    let (vault_authority, _) = Pubkey::find_program_address(
+        &[b"authority", wrapper_mint.as_ref()],
+        &crate::OVERPASS_PROGRAM_ID,
+    );
     let (save_lending_market_authority, _) =
         Pubkey::find_program_address(&[state.lending_market.as_ref()], &SAVE_PROGRAM_ID);
 
-    let (user_underlying_ata, user_wrapper_ata) = match direction {
-        Direction::Deposit => (params.source_token_account, params.destination_token_account),
-        Direction::Withdraw => (params.destination_token_account, params.source_token_account),
-    };
-    let vault_underlying_ata = derive_ata(&vault_authority, &underlying_mint, &SPL_TOKEN_PROGRAM_ID);
-    let vault_collateral_ata = derive_ata(&vault_authority, &collateral_mint, &SPL_TOKEN_PROGRAM_ID);
+    let user_underlying_ata = derive_ata(user, &underlying_mint, &SPL_TOKEN_PROGRAM_ID);
+    let user_wrapper_ata = derive_ata(user, &wrapper_mint, &SPL_TOKEN_PROGRAM_ID);
+    let vault_underlying_ata =
+        derive_ata(&vault_authority, &underlying_mint, &SPL_TOKEN_PROGRAM_ID);
+    let vault_collateral_ata =
+        derive_ata(&vault_authority, &collateral_mint, &SPL_TOKEN_PROGRAM_ID);
 
     let mut metas = vec![
-        AccountMeta::new(user, true),
+        AccountMeta::new(*user, true),
         AccountMeta::new_readonly(global_config, false),
         AccountMeta::new(wrapper_vault_pda, false),
         AccountMeta::new_readonly(vault_authority, false),
@@ -67,4 +67,20 @@ pub fn build(
     }
 
     Ok(metas)
+}
+
+pub fn build_deposit(
+    state: &SaveState,
+    wv: &WrapperVault,
+    user: &Pubkey,
+) -> Result<Vec<AccountMeta>, OverpassError> {
+    build_base(state, wv, user)
+}
+
+pub fn build_withdraw(
+    state: &SaveState,
+    wv: &WrapperVault,
+    user: &Pubkey,
+) -> Result<Vec<AccountMeta>, OverpassError> {
+    build_base(state, wv, user)
 }
