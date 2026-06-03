@@ -25,5 +25,5 @@ pub fn program_dependencies() -> Vec<(Pubkey, String)> {
 pub const ACCOUNTS_LEN: usize = 36;
 
 pub fn is_active(_state: &LuloState) -> bool {
-    true
+    false
 }
