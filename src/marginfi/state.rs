@@ -1,7 +1,7 @@
 use fixed::types::I80F48;
 use solana_program::pubkey::Pubkey;
 
-use crate::common::bytes::{read_pubkey, read_u32, read_u64};
+use crate::common::bytes::{read_pubkey, read_u32, read_u64, read_u128};
 use crate::error::OverpassError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -238,10 +238,9 @@ pub fn decode(data: &[u8]) -> Result<MarginfiState, OverpassError> {
 }
 
 pub fn read_wrapped_i80f48(data: &[u8], offset: usize) -> Result<I80F48, OverpassError> {
-    let raw: [u8; 16] = data[offset..offset + 16]
-        .try_into()
-        .map_err(|_| OverpassError::InvalidAccount("marginfi bank: WrappedI80F48 slice"))?;
-    Ok(I80F48::from_bits(i128::from_le_bytes(raw)))
+    Ok(I80F48::from_bits(
+        read_u128(data, offset, "marginfi bank: WrappedI80F48 slice")? as i128,
+    ))
 }
 
 fn read_rate_points(data: &[u8], offset: usize) -> Result<[RatePoint; 5], OverpassError> {
