@@ -53,6 +53,44 @@ const JUP_AUTHORITY_F_TOKEN_USDC_ATA: Pubkey =
 
 const SYSVAR_RENT_ID: Pubkey =
     Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");
+const SYSVAR_INSTRUCTIONS_ID: Pubkey =
+    Pubkey::from_str_const("Sysvar1nstructions1111111111111111111111111");
+
+const LULO_POOL_JLUSDC_ATA: Pubkey =
+    Pubkey::from_str_const("GhmCHQhFhFX9vbxAskH7c1ymNzxyN5kaza4Zqqms6zWL");
+const LULO_TRAILING_ACCOUNT: Pubkey =
+    Pubkey::from_str_const("43kuLXFrEEExVP6n3fDprjbKvzMRqhLdLk24f4TQaiGv");
+
+const KAMINO_PROTOCOL_AUTHORITY: Pubkey =
+    Pubkey::from_str_const("4dg3naKuGezNCzNY2qrTFCzsNZG8hcdkzzNT5PFLZFLR");
+const KAMINO_PROTOCOL_TOKEN_ACCOUNT: Pubkey =
+    Pubkey::from_str_const("mZovrHTXASkL3jUE5Usqtgtau7iKF5dXStAwbAu1wyx");
+const KAMINO_MARKET: Pubkey =
+    Pubkey::from_str_const("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF");
+const KAMINO_OBLIGATION: Pubkey =
+    Pubkey::from_str_const("H3LwbNZyccycRro2V1xjS4ASfKADa6KKuE8AwUomSZeU");
+const KAMINO_RESERVE: Pubkey =
+    Pubkey::from_str_const("D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59");
+const KAMINO_RESERVE_LIQUIDITY_SUPPLY: Pubkey =
+    Pubkey::from_str_const("Bgq7trRgVMeq33yt235zM2onQ4bRDBsY5EWiTetF4qw6");
+const KAMINO_LENDING_MARKET_AUTHORITY: Pubkey =
+    Pubkey::from_str_const("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo");
+const KAMINO_COLLATERAL_MINT: Pubkey =
+    Pubkey::from_str_const("B8V6WVjPxW1UGwVDfxH2d2r8SyT4cqn7dQRK6XneVa7D");
+const KAMINO_COLLATERAL_TOKEN_ACCOUNT: Pubkey =
+    Pubkey::from_str_const("BBaPKj94sodQurHUYRyBb19xxhXXJt1hbjimactKRR91");
+const KAMINO_RESERVE_COLLATERAL_SUPPLY: Pubkey =
+    Pubkey::from_str_const("3DzjXRfxRm6iejfyyMynR4tScddaanrePJ1NJU2XnPPL");
+const KAMINO_PROGRAM: Pubkey =
+    Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+const KAMINO_FARMS_PROGRAM: Pubkey =
+    Pubkey::from_str_const("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr");
+const KAMINO_RESERVE_FARM_STATE: Pubkey =
+    Pubkey::from_str_const("JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh");
+const KAMINO_OBLIGATION_FARM_USER_STATE: Pubkey =
+    Pubkey::from_str_const("FtKHAgqLSeXv3nngZR4PuXQct4yPf5KXCkHJ8wbzR7SR");
+const KAMINO_SCOPE_PRICES: Pubkey =
+    Pubkey::from_str_const("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH");
 
 const PD_OFF_PROTECTED_MINT: usize = 0;
 const PD_OFF_POOL_ID: usize = 32;
@@ -143,6 +181,8 @@ pub fn build_deposit(
 ) -> Result<Vec<AccountMeta>, OverpassError> {
     let mut metas = build_base(state, wv, user)?;
     metas.extend_from_slice(&[
+        AccountMeta::new_readonly(LULO_POOL_JLUSDC_ATA, false),
+        AccountMeta::new_readonly(LULO_TRAILING_ACCOUNT, false),
         AccountMeta::new_readonly(LULO_PROGRAM_ID, false),
         AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false),
@@ -154,13 +194,9 @@ pub fn build_deposit(
     Ok(metas)
 }
 
-pub fn build_withdraw(
-    state: &LuloState,
-    wv: &WrapperVault,
-    user: &Pubkey,
-) -> Result<Vec<AccountMeta>, OverpassError> {
-    let mut metas = build_base(state, wv, user)?;
-    metas.extend_from_slice(&[
+#[allow(dead_code)]
+fn jupiter_withdraw_backend() -> Vec<AccountMeta> {
+    vec![
         AccountMeta::new(JUP_PROTOCOL_AUTHORITY, false),
         AccountMeta::new(JUP_PROTOCOL_AUTHORITY_USDC_ATA, false),
         AccountMeta::new(JUP_AUTHORITY_F_TOKEN_USDC_ATA, false),
@@ -176,6 +212,46 @@ pub fn build_withdraw(
         AccountMeta::new_readonly(JUP_REWARDS_RATE_MODEL, false),
         AccountMeta::new(JUP_LIQUIDITY_PROGRAM, false),
         AccountMeta::new_readonly(JUP_PROGRAM, false),
+    ]
+}
+
+fn kamino_withdraw_backend() -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(KAMINO_PROTOCOL_AUTHORITY, false),
+        AccountMeta::new(KAMINO_PROTOCOL_TOKEN_ACCOUNT, false),
+        AccountMeta::new(KAMINO_MARKET, false),
+        AccountMeta::new(KAMINO_OBLIGATION, false),
+        AccountMeta::new(KAMINO_RESERVE, false),
+        AccountMeta::new(KAMINO_RESERVE_LIQUIDITY_SUPPLY, false),
+        AccountMeta::new_readonly(KAMINO_LENDING_MARKET_AUTHORITY, false),
+        AccountMeta::new(KAMINO_COLLATERAL_MINT, false),
+        AccountMeta::new(KAMINO_COLLATERAL_TOKEN_ACCOUNT, false),
+        AccountMeta::new(KAMINO_RESERVE_COLLATERAL_SUPPLY, false),
+        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
+        AccountMeta::new_readonly(KAMINO_PROGRAM, false),
+        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM, false),
+        AccountMeta::new(KAMINO_RESERVE_FARM_STATE, false),
+        AccountMeta::new(KAMINO_OBLIGATION_FARM_USER_STATE, false),
+        AccountMeta::new_readonly(KAMINO_SCOPE_PRICES, false),
+    ]
+}
+
+fn withdraw_trailing() -> [AccountMeta; 3] {
+    [
+        AccountMeta::new(LULO_POOL_INPUT_TOKEN_ACCOUNT, false),
+        AccountMeta::new_readonly(LULO_POOL_JLUSDC_ATA, false),
+        AccountMeta::new_readonly(LULO_TRAILING_ACCOUNT, false),
+    ]
+}
+
+pub fn build_withdraw(
+    state: &LuloState,
+    wv: &WrapperVault,
+    user: &Pubkey,
+) -> Result<Vec<AccountMeta>, OverpassError> {
+    let mut metas = build_base(state, wv, user)?;
+    metas.extend_from_slice(&[
         AccountMeta::new_readonly(LULO_PROGRAM_ID, false),
         AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false),
@@ -183,5 +259,7 @@ pub fn build_withdraw(
         AccountMeta::new_readonly(ATA_PROGRAM_ID, false),
         AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
     ]);
+    metas.extend(kamino_withdraw_backend());
+    metas.extend_from_slice(&withdraw_trailing());
     Ok(metas)
 }
