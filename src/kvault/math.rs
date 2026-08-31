@@ -7,6 +7,7 @@ use crate::klend;
 use crate::klend::fraction::Fraction;
 
 const SECONDS_PER_YEAR: u128 = 31_556_926;
+const MAX_QUOTE_DEPOSIT: u64 = u64::MAX / 32;
 
 pub fn quote_deposit(
     state: &KvaultState,
@@ -45,6 +46,18 @@ pub fn quote_deposit(
         .ok_or(OverpassError::InvalidAmount)?;
     if max_user_tokens < state.min_deposit_amount {
         return Err(OverpassError::InvalidAmount);
+    }
+
+    let protocol_cap: u64 = if state.deposit_cap == 0 {
+        u64::MAX
+    } else {
+        let aum_ceil: u64 = compute_current_aum(state, current_slot, unix_timestamp)
+            .map(|f| f.ceil().to_num::<u128>().min(u64::MAX as u128) as u64)
+            .unwrap_or(u64::MAX);
+        state.deposit_cap.saturating_sub(aum_ceil)
+    };
+    if max_user_tokens > protocol_cap.min(MAX_QUOTE_DEPOSIT) {
+        return Err(OverpassError::DepositLimitExceeded);
     }
 
     let aum = compute_current_aum(state, current_slot, unix_timestamp)?;
@@ -172,7 +185,7 @@ pub fn quote_withdraw(
             .ok_or(OverpassError::AccountMissing(
                 "kvault primary reserve (not in update map)",
             ))?;
-        let accrued = klend::math::accrue_interest(reserve, current_slot);
+        let accrued = klend::math::accrue_interest(reserve, current_slot, unix_timestamp)?;
         let total_supply = klend::math::total_supply_fraction(reserve, &accrued);
         let (cs, ts) =
             klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);
@@ -231,7 +244,7 @@ fn compute_current_aum(
     current_slot: u64,
     unix_timestamp: i64,
 ) -> Result<Fraction, OverpassError> {
-    let invested_total = invested_total(state, current_slot)?;
+    let invested_total = invested_total(state, current_slot, unix_timestamp)?;
     let available = Fraction::from_num(state.token_available);
     let holdings_total = available + invested_total;
     let pending_fees_after_charge = charged_pending_fees(state, unix_timestamp, invested_total)?;
@@ -244,10 +257,14 @@ fn compute_current_aum(
     Ok(holdings_total - pending_fees_after_charge)
 }
 
-fn invested_total(state: &KvaultState, current_slot: u64) -> Result<Fraction, OverpassError> {
+fn invested_total(
+    state: &KvaultState,
+    current_slot: u64,
+    unix_timestamp: i64,
+) -> Result<Fraction, OverpassError> {
     let mut total = Fraction::ZERO;
     for alloc in &state.active_allocations {
-        total += invested_for_allocation(state, current_slot, alloc)?;
+        total += invested_for_allocation(state, current_slot, unix_timestamp, alloc)?;
     }
     Ok(total)
 }
@@ -255,6 +272,7 @@ fn invested_total(state: &KvaultState, current_slot: u64) -> Result<Fraction, Ov
 fn invested_for_allocation(
     state: &KvaultState,
     current_slot: u64,
+    unix_timestamp: i64,
     alloc: &ActiveAllocation,
 ) -> Result<Fraction, OverpassError> {
     let reserve = state
@@ -266,7 +284,7 @@ fn invested_for_allocation(
             "kvault allocation reserve (not in update map)",
         ))?;
 
-    let accrued = klend::math::accrue_interest(reserve, current_slot);
+    let accrued = klend::math::accrue_interest(reserve, current_slot, unix_timestamp)?;
     let total_supply = klend::math::total_supply_fraction(reserve, &accrued);
     let (cs, ts) =
         klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);

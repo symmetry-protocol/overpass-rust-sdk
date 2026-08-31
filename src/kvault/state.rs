@@ -31,6 +31,7 @@ const OFF_MIN_WITHDRAW_AMOUNT: usize = 8 + 58408;
 const OFF_BASE_VAULT_AUTHORITY: usize = 8 + 32;
 const OFF_WITHDRAWAL_PENALTY_LAMPORTS: usize = 8 + 58672;
 const OFF_WITHDRAWAL_PENALTY_BPS: usize = 8 + 58680;
+const OFF_DEPOSIT_CAP: usize = 8 + 58728;
 
 const ALLOC_OFF_RESERVE: usize = 0;
 const ALLOC_OFF_CTOKEN_VAULT: usize = 32;
@@ -90,6 +91,7 @@ pub struct KvaultState {
     pub underlying_token_program: Pubkey,
 
     pub position_kvault_shares: u128,
+    pub deposit_cap: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +161,7 @@ pub fn decode(data: &[u8]) -> Result<KvaultState, OverpassError> {
         OFF_WITHDRAWAL_PENALTY_BPS,
         "kvault.withdrawal_penalty_bps",
     )?;
+    let deposit_cap = read_u64(data, OFF_DEPOSIT_CAP, "kvault.deposit_cap")?;
 
     let mut active_allocations = Vec::with_capacity(4);
     for i in 0..MAX_RESERVES {
@@ -222,6 +225,7 @@ pub fn decode(data: &[u8]) -> Result<KvaultState, OverpassError> {
         cached_farm_state: None,
         underlying_token_program: SPL_TOKEN_PROGRAM_ID,
         position_kvault_shares: 0,
+        deposit_cap,
     })
 }
 

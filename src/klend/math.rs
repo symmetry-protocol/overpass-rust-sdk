@@ -11,7 +11,11 @@ use crate::error::OverpassError;
 pub const POINTS_IN_CURVE: usize = 11;
 pub const POINT_SIZE: usize = 8;
 pub const SLOTS_PER_YEAR: u64 = 63_072_000;
+pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 pub const PROGRAM_VERSION: u64 = 1;
+
+const INTEREST_RATE_BASIS_LEGACY: u8 = 0;
+const INTEREST_RATE_BASIS_TRUE_APR: u8 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AccruedKlend {
@@ -109,15 +113,64 @@ fn utilization_rate(borrowed_sf: u128, total_supply: Fraction) -> Fraction {
     Fraction::from_bits(borrowed_sf) / total_supply
 }
 
-pub fn accrue_interest(state: &KlendState, current_slot: u64) -> AccruedKlend {
-    let slots_elapsed = current_slot.saturating_sub(state.last_update_slot);
-    if slots_elapsed == 0 {
-        return AccruedKlend {
+struct AccrualDuration {
+    elapsed_units: u64,
+    units_per_year: u128,
+}
+
+impl AccrualDuration {
+    fn since(
+        basis: u8,
+        last_update_slot: u64,
+        last_update_timestamp: u64,
+        current_slot: u64,
+        unix_timestamp: i64,
+    ) -> Result<Self, OverpassError> {
+        match basis {
+            INTEREST_RATE_BASIS_LEGACY => Ok(Self {
+                elapsed_units: current_slot.saturating_sub(last_update_slot),
+                units_per_year: SLOTS_PER_YEAR as u128,
+            }),
+            INTEREST_RATE_BASIS_TRUE_APR => {
+                let now = unix_timestamp.max(0) as u64;
+                let elapsed_units = if last_update_timestamp == 0 {
+                    0
+                } else {
+                    now.saturating_sub(last_update_timestamp)
+                };
+                Ok(Self {
+                    elapsed_units,
+                    units_per_year: SECONDS_PER_YEAR as u128,
+                })
+            }
+            _ => Err(OverpassError::InvalidAccount("klend.interest_rate_basis")),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.elapsed_units == 0
+    }
+}
+
+pub fn accrue_interest(
+    state: &KlendState,
+    current_slot: u64,
+    unix_timestamp: i64,
+) -> Result<AccruedKlend, OverpassError> {
+    let duration = AccrualDuration::since(
+        state.interest_rate_basis,
+        state.last_update_slot,
+        state.last_update_timestamp,
+        current_slot,
+        unix_timestamp,
+    )?;
+    if duration.is_zero() {
+        return Ok(AccruedKlend {
             borrowed_amount_sf: state.borrowed_amount_sf,
             accumulated_protocol_fees_sf: state.accumulated_protocol_fees_sf,
             pending_referrer_fees_sf: state.pending_referrer_fees_sf,
             accumulated_referrer_fees_sf: state.accumulated_referrer_fees_sf,
-        };
+        });
     }
 
     let pre_total_supply = total_supply_fraction_pre(state);
@@ -129,10 +182,14 @@ pub fn accrue_interest(state: &KlendState, current_slot: u64) -> AccruedKlend {
 
     let compounded_interest_rate = approximate_compounded_interest(
         current_borrow_rate + host_fixed_interest_rate,
-        slots_elapsed,
+        duration.elapsed_units,
+        duration.units_per_year,
     );
-    let compounded_fixed_rate =
-        approximate_compounded_interest(host_fixed_interest_rate, slots_elapsed);
+    let compounded_fixed_rate = approximate_compounded_interest(
+        host_fixed_interest_rate,
+        duration.elapsed_units,
+        duration.units_per_year,
+    );
 
     let previous_debt_f = Fraction::from_bits(state.borrowed_amount_sf);
     let acc_protocol_fees_f = Fraction::from_bits(state.accumulated_protocol_fees_sf);
@@ -147,12 +204,12 @@ pub fn accrue_interest(state: &KlendState, current_slot: u64) -> AccruedKlend {
     let new_acc_protocol_fees_f =
         acc_protocol_fees_f + fixed_host_fee + variable_protocol_fee_f - max_referrers_fees_f;
 
-    AccruedKlend {
+    Ok(AccruedKlend {
         borrowed_amount_sf: new_debt_f.to_bits(),
         accumulated_protocol_fees_sf: new_acc_protocol_fees_f.to_bits(),
         pending_referrer_fees_sf: state.pending_referrer_fees_sf + max_referrers_fees_f.to_bits(),
         accumulated_referrer_fees_sf: state.accumulated_referrer_fees_sf,
-    }
+    })
 }
 
 pub fn exchange_rate_pair(collateral_supply: u64, total_supply: Fraction) -> (u128, Fraction) {
@@ -282,6 +339,7 @@ pub fn fraction_liquidity_to_collateral_ceil(
 pub fn quote_deposit(
     state: &KlendState,
     current_slot: u64,
+    unix_timestamp: i64,
     wv: &WrapperVault,
     gc: &GlobalConfig,
     amount: u64,
@@ -302,7 +360,7 @@ pub fn quote_deposit(
         return Err(OverpassError::CTokenUsageBlocked);
     }
 
-    let accrued = accrue_interest(state, current_slot);
+    let accrued = accrue_interest(state, current_slot, unix_timestamp)?;
     let total_supply_f = total_supply_fraction(state, &accrued);
     let collateral_supply = state.collateral_mint_total_supply;
 
@@ -403,7 +461,7 @@ pub fn quote_withdraw(
         return Err(OverpassError::InvalidAmount);
     }
 
-    let accrued = accrue_interest(state, current_slot);
+    let accrued = accrue_interest(state, current_slot, unix_timestamp)?;
     let total_supply_f = total_supply_fraction(state, &accrued);
     let (cs, ts) = exchange_rate_pair(state.collateral_mint_total_supply, total_supply_f);
 

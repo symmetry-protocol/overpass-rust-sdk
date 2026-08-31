@@ -80,7 +80,7 @@ impl Overpass {
                 lulo::math::quote_withdraw(s, wv, amount)
             }
             (ProtocolState::Klend(s), Direction::Deposit) => {
-                klend::math::quote_deposit(s, slot, wv, gc, amount)
+                klend::math::quote_deposit(s, slot, ts, wv, gc, amount)
             }
             (ProtocolState::Klend(s), Direction::Withdraw) => {
                 klend::math::quote_withdraw(s, slot, ts, wv, amount)

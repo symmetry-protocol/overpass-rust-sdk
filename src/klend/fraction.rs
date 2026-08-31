@@ -63,11 +63,14 @@ fn checked_shl(number: U256, bit_count: u32) -> Option<U256> {
     }
 }
 
-pub fn approximate_compounded_interest(rate: Fraction, elapsed_slots: u64) -> Fraction {
-    let slots_per_year: u128 = super::math::SLOTS_PER_YEAR.into();
-    let base = rate / slots_per_year;
+pub fn approximate_compounded_interest(
+    rate: Fraction,
+    elapsed_units: u64,
+    units_per_year: u128,
+) -> Fraction {
+    let base = rate / units_per_year;
 
-    match elapsed_slots {
+    match elapsed_units {
         0 => return Fraction::ONE,
         1 => return Fraction::ONE + base,
         2 => return (Fraction::ONE + base) * (Fraction::ONE + base),
@@ -79,7 +82,7 @@ pub fn approximate_compounded_interest(rate: Fraction, elapsed_slots: u64) -> Fr
         _ => (),
     }
 
-    let exp: u128 = elapsed_slots.into();
+    let exp: u128 = elapsed_units.into();
     let exp_minus_one = exp.wrapping_sub(1);
     let exp_minus_two = exp.wrapping_sub(2);
 

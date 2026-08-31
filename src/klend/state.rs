@@ -11,6 +11,7 @@ pub const BORROW_RATE_CURVE_LEN: usize = 88;
 pub struct KlendState {
     pub version: u64,
     pub last_update_slot: u64,
+    pub last_update_timestamp: u64,
     pub lending_market: Pubkey,
     pub mint_pubkey: Pubkey,
     pub supply_vault: Pubkey,
@@ -31,6 +32,7 @@ pub struct KlendState {
     pub emergency_mode: bool,
     pub host_fixed_interest_rate_bps: u16,
     pub protocol_take_rate_pct: u8,
+    pub interest_rate_basis: u8,
     pub borrow_rate_curve: [u8; BORROW_RATE_CURVE_LEN],
     pub deposit_limit: u64,
     pub max_age_price_seconds: u64,
@@ -47,6 +49,7 @@ pub fn empty() -> KlendState {
     KlendState {
         version: 0,
         last_update_slot: 0,
+        last_update_timestamp: 0,
         lending_market: Pubkey::default(),
         mint_pubkey: Pubkey::default(),
         supply_vault: Pubkey::default(),
@@ -67,6 +70,7 @@ pub fn empty() -> KlendState {
         emergency_mode: false,
         host_fixed_interest_rate_bps: 0,
         protocol_take_rate_pct: 0,
+        interest_rate_basis: 0,
         borrow_rate_curve: [0; BORROW_RATE_CURVE_LEN],
         deposit_limit: 0,
         max_age_price_seconds: 0,
@@ -94,6 +98,11 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
 
     let version = read_u64(data, 8, "klend.version")?;
     let last_update_slot = read_u64(data, 16, "klend.last_update.slot")?;
+    let last_update_timestamp = u32::from_le_bytes(
+        data[28..32]
+            .try_into()
+            .map_err(|_| OverpassError::InvalidAccount("klend.last_update.timestamp"))?,
+    ) as u64;
     let lending_market = read_pubkey(data, 32, "klend.lending_market")?;
 
     let mint_pubkey = read_pubkey(data, 128, "klend.liquidity.mint_pubkey")?;
@@ -124,6 +133,7 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
         })?);
     let block_ctoken_usage = data[4862] != 0;
     let emergency_mode = data[4864] != 0;
+    let interest_rate_basis = data[4865];
     let protocol_take_rate_pct = data[4870];
 
     let borrow_rate_curve: [u8; BORROW_RATE_CURVE_LEN] = data[4920..5008]
@@ -148,6 +158,7 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
     Ok(KlendState {
         version,
         last_update_slot,
+        last_update_timestamp,
         lending_market,
         mint_pubkey,
         supply_vault,
@@ -168,6 +179,7 @@ pub fn decode(data: &[u8]) -> Result<KlendState, OverpassError> {
         emergency_mode,
         host_fixed_interest_rate_bps,
         protocol_take_rate_pct,
+        interest_rate_basis,
         borrow_rate_curve,
         deposit_limit,
         max_age_price_seconds,
