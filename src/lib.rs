@@ -52,6 +52,31 @@ impl Overpass {
         self.clock_ref.unix_timestamp.load(Ordering::Relaxed)
     }
 
+    fn position_accounts(&self) -> Result<Vec<Pubkey>, OverpassError> {
+        let wv = &self.wrapper_vault;
+        match &self.state {
+            ProtocolState::Klend(_) => Ok(vec![klend::account_metas::position_account(wv)?]),
+            ProtocolState::Save(_) => Ok(vec![save::account_metas::position_account(wv)?]),
+            ProtocolState::Lulo(_) => Ok(vec![lulo::account_metas::position_account(wv)?]),
+            ProtocolState::Kvault(_) => kvault::account_metas::position_accounts(wv),
+            ProtocolState::Marginfi(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn live_intermediate(&self, account_map: &AccountMap) -> Result<Option<u128>, OverpassError> {
+        let wv = &self.wrapper_vault;
+        let position_account = match &self.state {
+            ProtocolState::Kvault(s) => return Ok(Some(s.position_kvault_shares)),
+            ProtocolState::Marginfi(_) => return Ok(None),
+            ProtocolState::Klend(_) => klend::account_metas::position_account(wv)?,
+            ProtocolState::Save(_) => save::account_metas::position_account(wv)?,
+            ProtocolState::Lulo(_) => lulo::account_metas::position_account(wv)?,
+        };
+        let amount =
+            common::programs::read_token_amount_or_zero(account_map, &position_account)?;
+        Ok(Some(amount as u128))
+    }
+
     fn detect_direction(
         &self,
         input_mint: Pubkey,
@@ -253,6 +278,11 @@ impl Amm for Overpass {
             ProtocolState::Marginfi(s) => marginfi::update::accounts_to_update(s, wv),
             ProtocolState::Lulo(s) => lulo::update::accounts_to_update(s, wv),
         });
+        for k in self.position_accounts().unwrap_or_default() {
+            if !accts.contains(&k) {
+                accts.push(k);
+            }
+        }
         accts
     }
 
@@ -278,6 +308,12 @@ impl Amm for Overpass {
             ProtocolState::Lulo(s) => lulo::update::update(s, wv, account_map),
         }
         .map_err(anyhow::Error::from)?;
+        if let Some(live) = self
+            .live_intermediate(account_map)
+            .map_err(anyhow::Error::from)?
+        {
+            self.wrapper_vault.intermediate_held = live;
+        }
         Ok(())
     }
 

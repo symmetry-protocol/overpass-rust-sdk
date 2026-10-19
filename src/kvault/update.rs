@@ -3,35 +3,17 @@ use solana_program::pubkey::Pubkey;
 
 use super::state::{self, KvaultState, GLOBAL_CONFIG_SEED, PD_OFF_UNDERLYING_TOKEN_KIND};
 use crate::accounts::WrapperVault;
-use crate::common::bytes::{read_pubkey, read_u128, read_u64};
-use crate::common::programs::{derive_ata, SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
+use crate::common::bytes::{read_u128, read_u64};
+use crate::common::programs::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
 use crate::error::OverpassError;
 use crate::klend;
 
-use super::account_metas::FARMS_PROGRAM_ID;
+use super::account_metas::{position_accounts, FARMS_PROGRAM_ID};
 use super::KVAULT_PROGRAM_ID;
 
 const FARMS_USER_ACTIVE_STAKE_SCALED_OFFSET: usize = 408;
 const FARMS_USER_STATE_LEN: usize = 920;
 const SPL_TOKEN_AMOUNT_OFFSET: usize = 64;
-
-fn farm_position_keys(wv: &WrapperVault) -> Result<(Pubkey, Pubkey), OverpassError> {
-    let (vault_authority, _) = Pubkey::find_program_address(
-        &[b"authority", wv.wrapper_mint.as_ref()],
-        &crate::OVERPASS_PROGRAM_ID,
-    );
-    let kvault_share_mint = read_pubkey(&wv.protocol_data, 0, "kvault.pd.share_mint")?;
-    let vault_shares_ata = derive_ata(&vault_authority, &kvault_share_mint, &SPL_TOKEN_PROGRAM_ID);
-    let (farms_user_state, _) = Pubkey::find_program_address(
-        &[
-            b"user",
-            wv.source_position_pda.as_ref(),
-            vault_authority.as_ref(),
-        ],
-        &FARMS_PROGRAM_ID,
-    );
-    Ok((vault_shares_ata, farms_user_state))
-}
 
 pub fn accounts_to_update(state: &KvaultState, wv: &WrapperVault) -> Vec<Pubkey> {
     let (kvault_global_config, _) =
@@ -42,9 +24,8 @@ pub fn accounts_to_update(state: &KvaultState, wv: &WrapperVault) -> Vec<Pubkey>
     }
     if wv.protocol_data[48] != 0 {
         accts.push(wv.source_position_pda);
-        if let Ok((vault_shares_ata, farms_user_state)) = farm_position_keys(wv) {
-            accts.push(vault_shares_ata);
-            accts.push(farms_user_state);
+        if let Ok(position) = position_accounts(wv) {
+            accts.extend(position);
         }
     }
     accts
@@ -94,13 +75,15 @@ pub fn update(
         }
     }
 
+    let position_keys = position_accounts(wv)?;
+    let idle = match position_keys.first().and_then(|k| account_map.get(k)) {
+        Some(a) if !a.data.is_empty() => {
+            read_u64(&a.data, SPL_TOKEN_AMOUNT_OFFSET, "shares_ata.amount")?
+        }
+        _ => 0,
+    };
     new_state.position_kvault_shares = if wv.protocol_data[48] != 0 {
-        let (vault_shares_ata, farms_user_state) = farm_position_keys(wv)?;
-        let idle = match account_map.get(&vault_shares_ata) {
-            Some(a) => read_u64(&a.data, SPL_TOKEN_AMOUNT_OFFSET, "shares_ata.amount")?,
-            None => 0,
-        };
-        let user_stake_scaled = match account_map.get(&farms_user_state) {
+        let user_stake_scaled = match position_keys.get(1).and_then(|k| account_map.get(k)) {
             Some(a) if a.owner == FARMS_PROGRAM_ID && a.data.len() >= FARMS_USER_STATE_LEN => {
                 read_u128(
                     &a.data,
@@ -124,7 +107,7 @@ pub fn update(
             .checked_add(farm_kt as u128)
             .ok_or(OverpassError::MathOverflow)?
     } else {
-        wv.intermediate_held
+        idle as u128
     };
 
     new_state.underlying_token_program = if wv.protocol_data[PD_OFF_UNDERLYING_TOKEN_KIND] == 1 {

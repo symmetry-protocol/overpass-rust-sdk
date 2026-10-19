@@ -1,6 +1,8 @@
 use super::state::LuloState;
 use crate::accounts::{GlobalConfig, WrapperVault};
-use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64};
+use crate::common::checked::{
+    mul_bps, require_no_value_per_share_loss, u128_to_u64, MIN_DEPOSIT_SHARES_OUT,
+};
 use crate::common::u256::U256;
 use crate::error::OverpassError;
 
@@ -199,6 +201,9 @@ pub fn quote_deposit(
     };
     if wrapper_to_mint == 0 {
         return Err(math_err("mint zero"));
+    }
+    if wv.wrapper_supply != 0 && wrapper_to_mint < MIN_DEPOSIT_SHARES_OUT {
+        return Err(OverpassError::DepositSharesTooLow);
     }
 
     let new_wrapper_supply = wv

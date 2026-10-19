@@ -5,7 +5,8 @@ use super::state::{
     INTEREST_CURVE_SEVEN_POINT,
 };
 use crate::accounts::{GlobalConfig, WrapperVault};
-use crate::common::checked::{mul_bps, require_no_value_per_share_loss};
+use crate::common::checked::{mul_bps, require_no_value_per_share_loss, MIN_DEPOSIT_SHARES_OUT};
+use crate::common::u256::U256;
 use crate::error::OverpassError;
 
 const ASSET_TAG_DRIFT: u8 = 4;
@@ -98,16 +99,20 @@ pub fn quote_deposit(
         if pre_balance <= I80F48::ZERO {
             return Err(math_err("wrapper>0 pre-balance zero"));
         }
-        shares_delta
-            .checked_mul(I80F48::from_num(wv.wrapper_supply))
-            .and_then(|x| x.checked_div(pre_balance))
-            .ok_or(math_err("wrap calc"))?
-            .floor()
-            .checked_to_num::<u64>()
-            .ok_or(math_err("mint overflow"))?
+        let minted = U256::from(shares_delta.to_bits() as u128)
+            .checked_mul(U256::from(wv.wrapper_supply))
+            .and_then(|x| x.checked_div(U256::from(pre_balance.to_bits() as u128)))
+            .ok_or(math_err("wrap calc"))?;
+        if minted > U256::from(u64::MAX) {
+            return Err(math_err("mint overflow"));
+        }
+        minted.as_u64()
     };
     if wrapper_to_mint == 0 {
         return Err(math_err("mint zero"));
+    }
+    if wv.wrapper_supply != 0 && wrapper_to_mint < MIN_DEPOSIT_SHARES_OUT {
+        return Err(OverpassError::DepositSharesTooLow);
     }
 
     let pre_asset_shares_raw = pre_balance.to_bits().max(0) as u128;
@@ -160,10 +165,14 @@ pub fn quote_withdraw(
         bits as u128
     };
 
-    let shares_pro_rata_u128 = (amount as u128)
-        .checked_mul(total_shares_raw)
-        .and_then(|x| x.checked_div(wv.wrapper_supply as u128))
+    let shares_pro_rata = U256::from(amount)
+        .checked_mul(U256::from(total_shares_raw))
+        .and_then(|x| x.checked_div(U256::from(wv.wrapper_supply)))
         .ok_or(math_err("pro rata"))?;
+    if shares_pro_rata > U256::from(u128::MAX) {
+        return Err(math_err("pro rata"));
+    }
+    let shares_pro_rata_u128 = shares_pro_rata.low_u128();
     if shares_pro_rata_u128 == 0 {
         return Err(math_err("pro rata zero"));
     }

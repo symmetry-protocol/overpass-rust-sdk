@@ -51,4 +51,7 @@ pub enum OverpassError {
     BankReduceOnly,
     #[error("marginfi: deposit cap exceeded")]
     BankAssetCapacityExceeded,
+
+    #[error("deposit mints too few shares (possible inflation)")]
+    DepositSharesTooLow,
 }

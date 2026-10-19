@@ -3,6 +3,8 @@ use crate::error::OverpassError;
 
 pub const FULL_BPS: u32 = 10_000;
 
+pub const MIN_DEPOSIT_SHARES_OUT: u64 = 10_000;
+
 pub fn require_no_value_per_share_loss(
     old_value: u128,
     old_supply: u64,

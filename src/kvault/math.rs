@@ -1,6 +1,8 @@
 use super::state::{ActiveAllocation, KvaultState};
 use crate::accounts::{GlobalConfig, WrapperVault};
-use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64, FULL_BPS};
+use crate::common::checked::{
+    mul_bps, require_no_value_per_share_loss, u128_to_u64, FULL_BPS, MIN_DEPOSIT_SHARES_OUT,
+};
 use crate::common::u256::U256;
 use crate::error::OverpassError;
 use crate::klend;
@@ -44,9 +46,6 @@ pub fn quote_deposit(
     let max_user_tokens = net_amount
         .checked_sub(crank_funds)
         .ok_or(OverpassError::InvalidAmount)?;
-    if max_user_tokens < state.min_deposit_amount {
-        return Err(OverpassError::InvalidAmount);
-    }
 
     let protocol_cap: u64 = if state.deposit_cap == 0 {
         u64::MAX
@@ -62,24 +61,42 @@ pub fn quote_deposit(
 
     let aum = compute_current_aum(state, current_slot, unix_timestamp)?;
     let kvault_shares_to_mint = get_shares_to_mint(aum, max_user_tokens, state.shares_issued)?;
+    if amount_to_deposit_from_shares(aum, kvault_shares_to_mint, state.shares_issued)?
+        < state.min_deposit_amount
+    {
+        return Err(OverpassError::InvalidAmount);
+    }
     if kvault_shares_to_mint == 0 {
         return Err(OverpassError::InvalidAmount);
     }
 
     let wrapper_to_mint = if wv.wrapper_supply == 0 {
+        let donated = u128_to_u64(
+            state
+                .position_kvault_shares
+                .checked_mul(net_amount as u128)
+                .and_then(|x| x.checked_div(kvault_shares_to_mint as u128))
+                .ok_or(OverpassError::MathOverflow)?,
+        )?;
         net_amount
+            .checked_add(donated)
+            .ok_or(OverpassError::MathOverflow)?
     } else {
         if state.position_kvault_shares == 0 {
             return Err(OverpassError::InvalidState(
                 "kvault: wrapper_supply>0 but intermediate_held=0",
             ));
         }
-        u128_to_u64(
+        let shares = u128_to_u64(
             (kvault_shares_to_mint as u128)
                 .checked_mul(wv.wrapper_supply as u128)
                 .and_then(|x| x.checked_div(state.position_kvault_shares))
                 .ok_or(OverpassError::MathOverflow)?,
-        )?
+        )?;
+        if shares < MIN_DEPOSIT_SHARES_OUT {
+            return Err(OverpassError::DepositSharesTooLow);
+        }
+        shares
     };
     if wrapper_to_mint == 0 {
         return Err(OverpassError::InvalidAmount);
@@ -191,7 +208,11 @@ pub fn quote_withdraw(
             klend::math::exchange_rate_pair(reserve.collateral_mint_total_supply, total_supply);
         let in_reserve_liq_f =
             klend::math::fraction_collateral_to_liquidity(primary.ctoken_allocation, cs, ts)?;
-        let send_f = in_reserve_liq_f.min(Fraction::from_num(to_disinvest));
+        let need_f = Fraction::from_num(to_disinvest);
+        if in_reserve_liq_f < need_f {
+            return Err(OverpassError::InsufficientLiquidity);
+        }
+        let send_f = in_reserve_liq_f.min(need_f);
         if send_f == Fraction::ZERO {
             available_to_send
         } else {
@@ -357,6 +378,27 @@ fn get_shares_to_mint(
     let shares =
         fraction_full_mul_int_ratio(Fraction::from_num(shares_issued), user_amount, aum_ceil_u64)?;
     u128_to_u64(shares.floor().to_num::<u128>())
+}
+
+fn amount_to_deposit_from_shares(
+    aum: Fraction,
+    shares: u64,
+    shares_issued: u64,
+) -> Result<u64, OverpassError> {
+    if shares_issued == 0 {
+        return Ok(shares);
+    }
+    let lhs = U256::from(aum.to_bits())
+        .checked_mul(U256::from(shares))
+        .and_then(|x| x.checked_add(U256::from(shares_issued - 1)))
+        .ok_or(OverpassError::MathOverflow)?;
+    let bits: u128 = (lhs / U256::from(shares_issued))
+        .try_into()
+        .map_err(|_| OverpassError::MathOverflow)?;
+    let ceil = Fraction::from_bits(bits)
+        .checked_ceil()
+        .ok_or(OverpassError::MathOverflow)?;
+    u128_to_u64(ceil.to_num::<u128>())
 }
 
 fn fraction_full_mul_int_ratio(

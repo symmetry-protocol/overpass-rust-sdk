@@ -4,6 +4,7 @@ use solana_program::pubkey::Pubkey;
 use super::state::SaveState;
 use super::SAVE_PROGRAM_ID;
 use crate::accounts::{global_config_pda, WrapperVault};
+use crate::common::bytes::read_pubkey;
 use crate::common::programs::{
     derive_ata, ATA_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID,
 };
@@ -83,4 +84,19 @@ pub fn build_withdraw(
     user: &Pubkey,
 ) -> Result<Vec<AccountMeta>, OverpassError> {
     build_base(state, wv, user)
+}
+
+const PD_OFF_COLLATERAL_MINT: usize = 32;
+
+pub fn position_account(wv: &WrapperVault) -> Result<Pubkey, OverpassError> {
+    let (vault_authority, _) = Pubkey::find_program_address(
+        &[b"authority", wv.wrapper_mint.as_ref()],
+        &crate::OVERPASS_PROGRAM_ID,
+    );
+    let collateral_mint = read_pubkey(
+        &wv.protocol_data,
+        PD_OFF_COLLATERAL_MINT,
+        "save.protocol_data.collateral_mint",
+    )?;
+    Ok(derive_ata(&vault_authority, &collateral_mint, &SPL_TOKEN_PROGRAM_ID))
 }

@@ -263,3 +263,12 @@ pub fn build_withdraw(
     metas.extend_from_slice(&withdraw_trailing());
     Ok(metas)
 }
+
+pub fn position_account(wv: &WrapperVault) -> Result<Pubkey, OverpassError> {
+    let protected_mint = read_pubkey(
+        &wv.protocol_data,
+        PD_OFF_PROTECTED_MINT,
+        "lulo.protocol_data.protected_mint",
+    )?;
+    Ok(derive_ata(&wv.source_position_pda, &protected_mint, &TOKEN_2022_PROGRAM_ID))
+}

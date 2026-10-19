@@ -1,7 +1,9 @@
 use super::state::SaveState;
 use super::wad::{self, Wad, WAD};
 use crate::accounts::{GlobalConfig, WrapperVault};
-use crate::common::checked::{mul_bps, require_no_value_per_share_loss, u128_to_u64};
+use crate::common::checked::{
+    mul_bps, require_no_value_per_share_loss, u128_to_u64, MIN_DEPOSIT_SHARES_OUT,
+};
 use crate::error::OverpassError;
 
 const INITIAL_COLLATERAL_RATE: Wad = WAD;
@@ -171,18 +173,29 @@ pub fn quote_deposit(
     let wrapper_supply = wv.wrapper_supply;
     let prev_intermediate = wv.intermediate_held;
     let wrapper_to_mint = if wrapper_supply == 0 {
+        let donated = if prev_intermediate == 0 {
+            0
+        } else {
+            collateral_to_liquidity(u128_to_u64(prev_intermediate)?, exchange_rate_w)?
+        };
         net_amount
+            .checked_add(donated)
+            .ok_or(OverpassError::MathOverflow)?
     } else {
         if prev_intermediate == 0 {
             return Err(OverpassError::InvalidState("save: ctokens out of sync"));
         }
-        u128_to_u64(
+        let shares = u128_to_u64(
             (collateral_received as u128)
                 .checked_mul(wrapper_supply as u128)
                 .ok_or(OverpassError::MathOverflow)?
                 .checked_div(prev_intermediate)
                 .ok_or(OverpassError::MathOverflow)?,
-        )?
+        )?;
+        if shares < MIN_DEPOSIT_SHARES_OUT {
+            return Err(OverpassError::DepositSharesTooLow);
+        }
+        shares
     };
     if wrapper_to_mint == 0 {
         return Err(OverpassError::InvalidAmount);
